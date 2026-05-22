@@ -1167,7 +1167,7 @@ function siteHash(claims){
 //  Main processing
 // ═══════════════════════════════════════════════════════════
 
-const graph = { entities:{}, claims:[], clauses:[], vectors:{}, folds:{}, computedFolds:{}, merges:[], events:[], documents:[] };
+const graph = { entities:{}, claims:[], clauses:[], vectors:{}, folds:{}, computedFolds:{}, merges:[], events:[], documents:[], comprehension:{ progress:0, label:'idle' } };
 let currentDocId = null;
 function setCurrentDoc(source) {
   currentDocId = source.startsWith('http') ? source.replace(/https?:\/\/(www\.)?/,'').split(/[?#]/)[0].slice(0,60) : `pasted-${Date.now()}`;
@@ -1345,6 +1345,7 @@ async function processText(text) {
   const globalSeenKinds = new Set();
 
   setProgress(0, clauses.length);
+  setComprehension(0.1, 'parsing…');
   const quoteTracker = new QuoteTracker();
 
   // Positional tracking: entity first mentions and section boundaries
@@ -1670,6 +1671,7 @@ async function processText(text) {
 
   // Compute global surprises (whole document)
   graph.surprises = computeSurprises(register.clauseVecs, allResults, 0, register.clauseVecs.length);
+  setComprehension(0.2, 'parsed');
 
   if(graph.surprises.length > 0) {
     emit('SIG', 'Paradigm', 'Tracing', 'surprise-skim',
@@ -1719,21 +1721,40 @@ async function processText(text) {
 
   if(llmEngine && contentResults.length > 5) {
     try {
-      const sample = contentResults.slice(0, 5).map(r => r.clause).join('\n').slice(0, 300);
-      const surpriseSpans = (graph.surprises || []).slice(0, 5).map(s => s.text).join('\n').slice(0, 300);
+      setComprehension(0.25, 'identifying…');
+      // Build a real chunk of prose, up to ~3000 chars, drawn sequentially from the opening
+      const proseParts = [];
+      let charBudget = 3000;
+      for(const r of contentResults) {
+        if(charBudget <= 0) break;
+        const c = (r.clause || '').trim();
+        if(c.length < 10) continue;
+        const take = c.slice(0, charBudget);
+        proseParts.push(take);
+        charBudget -= take.length + 1;
+      }
+      const prose = proseParts.join('\n');
       const entityList = topEntities.map(([n]) => n).join(', ');
+      const urlVal = document.getElementById('url-input')?.value || '';
+      let metaLines = '';
+      if(urlVal && /^https?:/i.test(urlVal)) {
+        try { const u = new URL(urlVal); metaLines += `Source: ${u.hostname}${u.pathname}\n`; } catch(e) {}
+      }
+      if(wikiTitle) metaLines += `Title: ${decodeURIComponent(wikiTitle).replace(/_/g,' ')}\n`;
+      if(entityList) metaLines += `Frequent entities: ${entityList}\n`;
       const idReply = await llmEngine.chat.completions.create({
         messages: [
-          { role: 'system', content: 'Identify this text in one sentence. What is it? Who wrote it? What genre?' },
-          { role: 'user', content: `Entities: ${entityList}\nShape: ${textShape}, ${clauseCount} passages\nOpening:\n${sample}\n\nKey passages:\n${surpriseSpans}` },
+          { role: 'system', content: 'Identify this text in 1-2 sentences: what it is about, who wrote it, what genre or form. Be concrete and specific, grounded in the excerpt. If the excerpt does not make it clear, say so plainly — do not guess from the URL, entity list, or genre.' },
+          { role: 'user', content: `${metaLines}\n--- Opening of text ---\n${prose}` },
         ],
-        max_tokens: 60,
+        max_tokens: 160,
         temperature: 0.1,
       });
       const identification = (idReply.choices[0]?.message?.content || '').trim();
       if(identification.length > 10) {
         instantHyp = identification;
       }
+      setComprehension(0.4, 'identified');
     } catch(e) { /* LLM not ready yet, use mechanical hypothesis */ }
   }
 
@@ -1958,11 +1979,13 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
     const hasDialogueMarkers = toRead.filter(r => /^(ACT\s|SCENE\s|Enter\s|ROMEO|JULIET|BENVOLIO|MONTAGUE|CAPULET)/i.test(r.clause||'')).length > 5;
     if(hasDialogueMarkers || (graph.surprises && graph.surprises.length > 0)) {
       setStatus('Analyzing sections…');
+      setComprehension(0.45, 'skimming surprise regions…');
       const sections = detectSections(allResults, graph.surprises);
       if(sections.length > 1) {
         try {
           graph.sectionReadings = await runSectionAgents(sections, allResults, llmEngine);
           setStatus(`${graph.sectionReadings.length} sections analyzed. Starting clause reading…`);
+          setComprehension(0.6, `skimmed ${graph.sectionReadings.length} regions`);
 
           if(graph.sectionReadings.length > 0) {
             const sceneSummary = graph.sectionReadings.map(s => s.summary).filter(s => s.length > 10).join(' ');
@@ -1993,6 +2016,10 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
     const hypPrev = paraHyp ? ` | "${paraHyp.slice(0,35)}…"` : '';
     setStatus(`c${r.clauseIndex+1} [${i+1}/${toRead.length}] ${pct}% ✓${confirmations} ✎${corrections} ⊘${skipped}${hypPrev}`);
     setProgress(i, toRead.length);
+    if(i % 5 === 0 || i === toRead.length - 1) {
+      const readFrac = toRead.length > 0 ? i / toRead.length : 0;
+      setComprehension(0.6 + 0.35 * readFrac, `reading ${i+1}/${toRead.length}`);
+    }
 
     const hasTrigger = r.triggers && r.triggers.length > 0;
     if(hasTrigger && paraHyp && i > 3) {
@@ -2374,6 +2401,7 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
   graph.health = health;
 
   setProgress(toRead.length, toRead.length);
+  setComprehension(1.0, 'fully read');
   const merges = allReadings.filter(r => r.same).length;
   const healthIcon = health.score > 60 ? '🟢' : health.score > 30 ? '🟡' : '🔴';
   setStatus(`Done. ✓${confirmations} ✎${corrections} ⊘${skipped} | ${genre} ${healthIcon}${health.score}% | ${sectionHyps.length} sections | ${correctionCount} learned | ${hypEntries.length} hypotheses`);
@@ -2491,7 +2519,7 @@ function renderSourceExplorer() {
   const isRead = readCount > 0;
 
   let cardHtml = `<div onclick="toggleDocDetail()" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:12px;cursor:pointer;transition:background 0.15s" onmouseover="this.style.background='var(--bg)'" onmouseout="this.style.background='var(--surface2)'">`;
-  cardHtml += `<div style="font-size:13px;font-weight:600;color:var(--bright);margin-bottom:4px">${title.replace(/</g,'&lt;')}</div>`;
+  cardHtml += `<div style="display:flex;align-items:center;gap:8px;justify-content:space-between;margin-bottom:4px"><div style="font-size:13px;font-weight:600;color:var(--bright)">${title.replace(/</g,'&lt;')}</div>${comprehensionDotsHTML(graph.comprehension?.progress || 0, graph.comprehension?.label || 'comprehension')}</div>`;
   if(docHyp) cardHtml += `<div style="font-size:12px;color:var(--text);font-family:var(--serif);margin-bottom:6px;line-height:1.4">${docHyp.replace(/</g,'&lt;')}</div>`;
   cardHtml += '<div style="display:flex;gap:12px;font-size:10px;font-family:var(--mono);color:var(--dim)">';
   cardHtml += `<span>${clauseCount} clauses</span>`;
@@ -5030,6 +5058,31 @@ function setProgress(n,total){
   else{bar.classList.remove('active');}
 }
 
+function renderComprehensionDots(progress){
+  const N = 5;
+  let html = '';
+  for(let i = 0; i < N; i++){
+    const fill = Math.max(0, Math.min(1, progress * N - i));
+    const opacity = (0.18 + 0.82 * fill).toFixed(2);
+    const bg = fill > 0.55 ? 'var(--accent)' : 'var(--dim)';
+    html += `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${bg};opacity:${opacity};transition:opacity 0.35s,background 0.35s"></span>`;
+  }
+  return html;
+}
+function comprehensionDotsHTML(progress, label){
+  const p = Math.max(0, Math.min(1, progress || 0));
+  const lbl = (label || '').replace(/"/g,'&quot;');
+  return `<span data-comprehension title="${lbl}" style="display:inline-flex;gap:3px;align-items:center;vertical-align:middle">${renderComprehensionDots(p)}</span>`;
+}
+function setComprehension(progress, label){
+  const p = Math.max(0, Math.min(1, progress));
+  graph.comprehension = { progress: p, label: label || graph.comprehension?.label || '' };
+  document.querySelectorAll('[data-comprehension]').forEach(el => {
+    el.innerHTML = renderComprehensionDots(p);
+    if(label) el.title = label;
+  });
+}
+
 // Tabs
 document.querySelectorAll('.tab').forEach(tab=>{
   tab.addEventListener('click',()=>{
@@ -5063,6 +5116,7 @@ window.handleSend = async function() {
   const isLongText = text.length > 200 && !isURL;
 
   if(isURL) {
+    setComprehension(0, 'queued');
     document.getElementById('url-input').value = text;
 
     const wikiTitleMatch = text.match(/\/wiki\/([^?#]+)/);
@@ -5077,8 +5131,11 @@ window.handleSend = async function() {
     const linkHtml = `<div style="display:inline-block;max-width:360px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px 14px">
       <div style="display:flex;align-items:center;gap:8px">
         <span style="font-size:18px">🔗</span>
-        <div>
-          <div style="font-size:12px;font-weight:600;color:var(--accent)">${domain}</div>
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;justify-content:space-between">
+            <div style="font-size:12px;font-weight:600;color:var(--accent)">${domain}</div>
+            ${comprehensionDotsHTML(graph.comprehension?.progress || 0, graph.comprehension?.label || 'comprehension')}
+          </div>
           <div style="font-size:10px;color:var(--dim);font-family:var(--mono);word-break:break-all">${path.slice(0,60)}</div>
         </div>
       </div>
@@ -5092,6 +5149,7 @@ window.handleSend = async function() {
     appendChat('system', 'Fetching and reading…');
     await fetchAndProcess();
   } else if(isLongText) {
+    setComprehension(0, 'queued');
     document.getElementById('url-input').value = '(pasted text)';
     const preview = text.slice(0, 100).replace(/\n/g, ' ').trim();
     const title = preview.slice(0, 50) + (preview.length > 50 ? '…' : '');
@@ -5099,8 +5157,11 @@ window.handleSend = async function() {
     const cardHtml = `<div style="display:inline-block;max-width:320px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px 14px;cursor:pointer" onclick="this.querySelector('details')?.toggleAttribute('open')">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
         <span style="font-size:18px">📄</span>
-        <div>
-          <div style="font-size:12px;font-weight:600;color:var(--bright)">${title.replace(/</g,'&lt;')}</div>
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;justify-content:space-between">
+            <div style="font-size:12px;font-weight:600;color:var(--bright)">${title.replace(/</g,'&lt;')}</div>
+            ${comprehensionDotsHTML(graph.comprehension?.progress || 0, graph.comprehension?.label || 'comprehension')}
+          </div>
           <div style="font-size:10px;color:var(--dim);font-family:var(--mono)">${words.toLocaleString()} words · ${text.length.toLocaleString()} chars</div>
         </div>
       </div>

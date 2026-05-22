@@ -1226,6 +1226,48 @@ async function ollamaChat(messages, opts = {}) {
   return data.choices?.[0]?.message?.content || '';
 }
 
+async function ollamaChatStream(messages, opts = {}, onDelta) {
+  let res;
+  try {
+    res = await fetch(`${OLLAMA_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: ollamaModel,
+        messages,
+        temperature: opts.temperature || 0.1,
+        stream: true,
+      }),
+    });
+  } catch(e) { return ollamaChat(messages, opts); }
+  if(!res.body) return ollamaChat(messages, opts);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let full = '', buf = '';
+  while(true) {
+    const { done, value } = await reader.read();
+    if(done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    for(const line of lines) {
+      const t = line.trim();
+      if(!t.startsWith('data:')) continue;
+      const payload = t.slice(5).trim();
+      if(!payload || payload === '[DONE]') continue;
+      try {
+        const j = JSON.parse(payload);
+        const delta = j.choices?.[0]?.delta?.content || '';
+        if(delta) {
+          full += delta;
+          if(onDelta) { try { onDelta(full, delta); } catch(_) {} }
+        }
+      } catch(_) {}
+    }
+  }
+  return full;
+}
+
 function parseSectionResponse(response, section) {
   const summary = response.match(/SUMMARY:\s*(.+)/i)?.[1]?.trim() || '';
   const speakers = response.match(/SPEAKERS:\s*(.+)/i)?.[1]?.trim() || '';
@@ -1834,6 +1876,34 @@ function rebuildLedgers(){
 let llmEngine = null;
 let readingActive = false;
 let chatInterruptResolve = null; // set when chat needs the LLM during reading
+
+// Streaming wrapper for WebLLM. Calls onDelta(fullSoFar, delta) for each token.
+// Falls back to non-streaming if the engine does not support iteration.
+async function streamWebLLM(engine, opts, onDelta) {
+  if(!engine) return '';
+  try {
+    const stream = await engine.chat.completions.create({ ...opts, stream: true });
+    if(stream && typeof stream[Symbol.asyncIterator] === 'function') {
+      let full = '';
+      for await (const chunk of stream) {
+        const delta = chunk?.choices?.[0]?.delta?.content || '';
+        if(delta) {
+          full += delta;
+          if(onDelta) { try { onDelta(full, delta); } catch(_) {} }
+        }
+      }
+      return full;
+    }
+    const full = stream?.choices?.[0]?.message?.content || '';
+    if(full && onDelta) { try { onDelta(full, full); } catch(_) {} }
+    return full;
+  } catch(e) {
+    const reply = await engine.chat.completions.create({ ...opts, stream: false });
+    const full = reply?.choices?.[0]?.message?.content || '';
+    if(full && onDelta) { try { onDelta(full, full); } catch(_) {} }
+    return full;
+  }
+}
 
 // Pre-download LLM weights into browser Cache API (doesn't load into GPU)
 async function predownloadLLM() {
@@ -3121,12 +3191,28 @@ async function computeEntityFold(entityName, ent, streamEl, cursor) {
         const prompt = foldText
           ? `Current understanding of ${entityName}:\n"${foldText}"\n\nNew text about ${entityName}:\n${batchText}\n\nRevise your understanding of ${entityName} into one sentence. Keep what holds. Add what's new.`
           : `These sentences mention ${entityName}:\n${batchText}\n\nWhat do we know about ${entityName} from this? One sentence.`;
-        const reply = await llmEngine.chat.completions.create({
+
+        // Live streaming line in the think panel.
+        let liveLine = null;
+        if(streamEl) {
+          liveLine = document.createElement('div');
+          liveLine.style.cssText = 'font-size:10px;font-family:var(--mono);margin:1px 0;line-height:1.4;color:var(--amber)';
+          liveLine.textContent = '  → ';
+          streamEl.appendChild(liveLine);
+        }
+
+        const rawFold = await streamWebLLM(llmEngine, {
           messages: [{ role: 'user', content: prompt }],
           max_tokens: 50, temperature: 0.1,
+        }, (full) => {
+          if(liveLine) {
+            liveLine.textContent = `  → ${full}`;
+            if(streamEl) streamEl.scrollTop = streamEl.scrollHeight;
+          }
         });
-        foldText = stripPreamble((reply.choices[0]?.message?.content || '').trim());
-        log(`  → ${foldText}`, 'color:var(--amber)');
+        foldText = stripPreamble((rawFold || '').trim());
+        if(liveLine) liveLine.textContent = `  → ${foldText}`;
+        else log(`  → ${foldText}`, 'color:var(--amber)');
       } catch(e) {
         log(`  ✗ ${e.message || 'error'}`, 'color:var(--red)');
         if(String(e.message||'').includes('GPU') || String(e.message||'').includes('mapAsync')) gpuHealthy = false;
@@ -3613,7 +3699,15 @@ async function askQuestion(directText) {
       try {
         appendChat('system', 'Generating creative content…');
         const topClauses = graph.clauses.slice(0, 8).map(c => c.text).filter(t => t.length > 20).slice(0, 4);
-        const creativeReply = await llmEngine.chat.completions.create({
+
+        const synthDiv = document.createElement('div');
+        synthDiv.style.cssText = 'padding:8px 0';
+        synthDiv.innerHTML = `<div style="font-size:10px;color:var(--violet);font-family:var(--mono);margin-bottom:4px">✨ creative / synthetic</div><div class="synth-body" style="font-family:var(--serif);font-size:14px;line-height:1.7;color:var(--text);white-space:pre-wrap"></div>`;
+        document.getElementById('chat-messages').appendChild(synthDiv);
+        const synthBody = synthDiv.querySelector('.synth-body');
+        const scroller = document.getElementById('chat-messages');
+
+        const raw = await streamWebLLM(llmEngine, {
           messages: [
             { role: 'system', content: `You are a creative writer. ${question}. Use ONLY facts from the source material below as inspiration. Be creative and original.` },
             { role: 'user', content: ((graph.hypotheses?.doc || '') + '\n' + topClauses.join('\n')).slice(0, 800) },
@@ -3621,13 +3715,12 @@ async function askQuestion(directText) {
           max_tokens: 300,
           temperature: 0.8,
           frequency_penalty: 1.5,
+        }, (full) => {
+          synthBody.textContent = full;
+          scroller.scrollTop = scroller.scrollHeight;
         });
-        let output = trimRepetition((creativeReply.choices[0]?.message?.content || '').trim());
-
-        const synthDiv = document.createElement('div');
-        synthDiv.style.cssText = 'padding:8px 0';
-        synthDiv.innerHTML = `<div style="font-size:10px;color:var(--violet);font-family:var(--mono);margin-bottom:4px">✨ creative / synthetic</div><div style="font-family:var(--serif);font-size:14px;line-height:1.7;color:var(--text);white-space:pre-wrap">${output.replace(/</g,'&lt;')}</div>`;
-        document.getElementById('chat-messages').appendChild(synthDiv);
+        let output = trimRepetition((raw || '').trim());
+        synthBody.textContent = output;
 
         chatHistory.push({ ts: new Date().toISOString(), question, answer: output, creative: true });
       } catch(e) {
@@ -3761,14 +3854,11 @@ async function askQuestion(directText) {
   const classifiedOp = promptClassification?.operator?.name || 'DEF';
   const classifiedSite = promptClassification?.terrain?.name || 'Entity';
 
-  const restatement = promptClassification
-    ? `→ ${classifiedOp}(${classifiedSite}): ${resolvedQuestion.split(/\s+/).filter(w=>w.length>3).slice(0,4).join(', ')}`
+  // Internal classification — kept off the visible thread but available for
+  // the AI to judge answers and for chatHistory provenance.
+  const internalClassification = promptClassification
+    ? `${classifiedOp}(${classifiedSite}): ${resolvedQuestion.split(/\s+/).filter(w=>w.length>3).slice(0,4).join(', ')}`
     : restateQuestion(resolvedQuestion);
-  const restateEl = document.createElement('div');
-  restateEl.style.cssText = 'color:var(--dim);font-size:12px;font-family:var(--mono);padding:4px 0';
-  restateEl.textContent = restatement;
-  document.getElementById('chat-messages').appendChild(restateEl);
-  document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight;
 
   let readerBusy = false;
   if(readingActive) {
@@ -4137,11 +4227,18 @@ Be direct. 2-4 sentences. Don't hedge if you're confident.`;
     if(!llmEngine || !gpuOk || readerBusy) {
       if(readerBusy && ollamaAvailable) {
         try {
-          const ollamaReply = await ollamaChat([
+          const ollamaScroller = document.getElementById('chat-messages');
+          smoothedDiv.innerHTML = epistemicCard(isSyntheticQ ? 'SYNTHETIC' : 'INTERPRETED', '', { sublabel: 'via Ollama · streaming…' });
+          // Card structure: smoothedDiv > wrapper > [labelDiv, bodyDiv]
+          const ollamaBody = smoothedDiv.firstElementChild?.children?.[1] || null;
+          const ollamaRaw = await ollamaChatStream([
             { role: 'system', content: systemPrompt },
             { role: 'user', content: plan },
-          ], { temperature: 0.2 });
-          let answer = trimRepetition(ollamaReply.replace(/^(Sure,?|Of course,?|The text says that\s)/i, ''));
+          ], { temperature: 0.2 }, (full) => {
+            if(ollamaBody) ollamaBody.textContent = full;
+            ollamaScroller.scrollTop = ollamaScroller.scrollHeight;
+          });
+          let answer = trimRepetition((ollamaRaw || '').replace(/^(Sure,?|Of course,?|The text says that\s)/i, ''));
           smoothedDiv.innerHTML = epistemicCard(isSyntheticQ ? 'SYNTHETIC' : 'INTERPRETED', answer, { sublabel: 'via Ollama' });
           chatHistory.push({ ts: new Date().toISOString(), question: resolvedQuestion, answer, ollama: true });
           updateLastChat('system', provenanceNote);
@@ -4174,6 +4271,7 @@ Be direct. 2-4 sentences. Don't hedge if you're confident.`;
       }
     }
 
+    let streamCard = null;
     try {
       if(abort.aborted) { currentAnswerAbort = null; return; }
 
@@ -4259,7 +4357,17 @@ Be direct. 2-4 sentences. Don't hedge if you're confident.`;
       }
       answerPrompt += '\n\nAnswer the question directly and conversationally. Address all parts.';
 
-      const reply = await llmEngine.chat.completions.create({
+      // Live streaming card — text appears as it's generated.
+      streamCard = document.createElement('div');
+      const streamColor = isSyntheticQ ? 'var(--violet)' : 'var(--amber)';
+      const streamBg = isSyntheticQ ? 'color-mix(in srgb, var(--violet) 5%, transparent)' : 'rgba(240,192,96,0.05)';
+      streamCard.style.cssText = `border-left:3px solid ${streamColor};padding:6px 10px;margin-bottom:6px;background:${streamBg};border-radius:0 6px 6px 0`;
+      streamCard.innerHTML = `<div style="font-size:9px;color:${streamColor};font-family:var(--mono);margin-bottom:2px">${isSyntheticQ ? '✨ SYNTHETIC' : 'INTERPRETED'} <span style="opacity:0.6">· streaming…</span></div><div class="stream-body" style="font-family:var(--serif);font-size:14px;line-height:1.7;color:var(--text);white-space:pre-wrap"></div>`;
+      answerCards.appendChild(streamCard);
+      const streamBody = streamCard.querySelector('.stream-body');
+      const chatScroller = document.getElementById('chat-messages');
+
+      const rawDraft = await streamWebLLM(llmEngine, {
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: answerPrompt },
@@ -4267,10 +4375,14 @@ Be direct. 2-4 sentences. Don't hedge if you're confident.`;
         max_tokens: 250,
         temperature: 0.3,
         frequency_penalty: 1.2,
+      }, (full) => {
+        streamBody.textContent = full;
+        chatScroller.scrollTop = chatScroller.scrollHeight;
       });
-      let draft = (reply.choices[0]?.message?.content || '').trim();
+      let draft = (rawDraft || '').trim();
       draft = draft.replace(/^(Sure,?|Of course,?|Based on the provided evidence,?|Here'?s?\s|The text says that\s)/i, '');
       draft = trimRepetition(draft);
+      streamBody.textContent = draft;
       logThink('DEF', draft.slice(0, 150));
 
       if(abort.aborted) return;
@@ -4402,27 +4514,52 @@ Be direct. 2-4 sentences. Don't hedge if you're confident.`;
       if(evaScore < 0.6 && issues.length > 0 && !abort.aborted && llmEngine) {
         logThink('REC', `revising: ${issues.join('; ')}`);
         try {
-          const recReply = await llmEngine.chat.completions.create({
+          const labelEl = streamCard.querySelector('div');
+          if(labelEl) labelEl.innerHTML = `${isSyntheticQ ? '✨ SYNTHETIC' : 'INTERPRETED'} <span style="opacity:0.6">· revising…</span>`;
+          const recRaw = await streamWebLLM(llmEngine, {
             messages: [
               { role: 'system', content: 'Revise this answer based on the feedback. Only state facts from the evidence. Any quoted text must be verbatim from the source.' },
               { role: 'user', content: `Evidence:\n${plan}\n\nDraft: ${draft}\n\nFeedback:\n${issues.map((is,i)=>`${i+1}. ${is}`).join('\n')}\n\nRevised answer:` },
             ],
             max_tokens: 200,
             temperature: 0.15,
+          }, (full) => {
+            streamBody.textContent = full;
+            chatScroller.scrollTop = chatScroller.scrollHeight;
           });
-          finalAnswer = (recReply.choices[0]?.message?.content || draft).trim().replace(/^(Sure,?|Here'?s?\s)/i, '');
+          finalAnswer = (recRaw || draft).trim().replace(/^(Sure,?|Here'?s?\s)/i, '');
+          streamBody.textContent = finalAnswer;
           logThink('REC', 'revised: ' + finalAnswer.slice(0, 150));
         } catch(e) { logThink('REC', 'revision failed, using draft'); }
       }
 
-      const topEvidence = projection.clauses.slice(0, 3)
-        .map(c => c.text).filter(t => t.length > 20 && /[.!?]/.test(t.slice(0, 150)));
-      if(topEvidence.length > 0) {
+      // CITED — every source span used as evidence for the assertion above,
+      // with clause indices for traceability and speaker tags for quotes.
+      const citedClauses = projection.clauses
+        .filter(c => c.text && c.text.length > 15)
+        .slice(0, 6);
+      if(citedClauses.length > 0) {
         const citedCard = document.createElement('div');
-        citedCard.innerHTML = epistemicCard('CITED', topEvidence[0].slice(0, 200), { small: true });
+        const cBlue = 'var(--blue, #4a9eff)';
+        citedCard.style.cssText = `border-left:3px solid ${cBlue};padding:6px 10px;margin-bottom:6px;background:color-mix(in srgb, ${cBlue} 5%, transparent);border-radius:0 6px 6px 0;animation:fadeIn 0.3s ease-in`;
+        let citedHtml = `<div style="font-size:9px;color:${cBlue};font-family:var(--mono);margin-bottom:4px">CITED — ${citedClauses.length} source span${citedClauses.length === 1 ? '' : 's'}</div>`;
+        for(const c of citedClauses) {
+          const r = allResults.find(ar => ar.clauseIndex === c.index);
+          const speaker = r?.quoteState;
+          const text = c.text.slice(0, 260).replace(/</g, '&lt;');
+          const ellipsis = c.text.length > 260 ? '…' : '';
+          if(speaker && speaker.depth > 0 && speaker.detectedSpeaker) {
+            citedHtml += `<div style="font-family:var(--serif);font-size:13px;line-height:1.55;margin:4px 0;padding:2px 0 2px 8px;border-left:1px solid color-mix(in srgb, ${cBlue} 35%, transparent)"><span style="font-family:var(--mono);font-size:9px;color:var(--amber);margin-right:6px">c${c.index+1} · ${speaker.detectedSpeaker} ${speaker.detectedVia||'said'}</span>"${text}${ellipsis}"</div>`;
+          } else {
+            citedHtml += `<div style="font-family:var(--serif);font-size:13px;line-height:1.55;margin:4px 0;padding:2px 0 2px 8px;border-left:1px solid color-mix(in srgb, ${cBlue} 35%, transparent)"><span style="font-family:var(--mono);font-size:9px;color:${cBlue};margin-right:6px">c${c.index+1}</span>${text}${ellipsis}</div>`;
+          }
+        }
+        citedCard.innerHTML = citedHtml;
         answerCards.appendChild(citedCard);
       }
 
+      // Replace the live streaming card with the final, animated interp card.
+      if(streamCard && streamCard.parentNode) streamCard.remove();
       const interpCard = document.createElement('div');
       const finalNames = finalAnswer.match(/[A-Z][a-z]+(?:\s[A-Z][a-z]+)*/g) || [];
       const stillBad = finalNames.filter(n => !allEvidenceLower.includes(n.toLowerCase()) && n.length > 3 && !skipNames.has(n));
@@ -4434,10 +4571,11 @@ Be direct. 2-4 sentences. Don't hedge if you're confident.`;
         interpCard.style.cssText = 'border-left:3px solid var(--amber);padding:6px 10px;margin-bottom:6px;background:rgba(240,192,96,0.05);border-radius:0 6px 6px 0;animation:fadeIn 0.3s ease-in';
         let interpHtml = `<div style="font-size:9px;color:var(--amber);font-family:var(--mono);margin-bottom:2px">INTERPRETED</div>`;
         interpHtml += `<div style="font-family:var(--serif);font-size:14px;line-height:1.7;color:var(--text)">${finalAnswer.replace(/</g,'&lt;').replace(/\n/g,'<br>')}</div>`;
+        // Only surface factual verification failures. Operator/shape
+        // classification mismatches stay in the internal think log so the
+        // AI can use them without cluttering the visible thread.
         const warnings = [];
         if(stillBad.length > 0) warnings.push(`unverified: ${stillBad.join(', ')}`);
-        if(!operatorMatch) warnings.push(sufficiencyNote);
-        if(respFit.issues.length > 0) warnings.push(respFit.issues[0]);
         if(warnings.length > 0) interpHtml += `<div style="margin-top:4px;font-size:10px;color:var(--red)">⚠ ${warnings.join(' · ')}</div>`;
         interpCard.innerHTML = interpHtml;
       }
@@ -4500,6 +4638,7 @@ Be direct. 2-4 sentences. Don't hedge if you're confident.`;
       );
 
     } catch(e) {
+      if(streamCard && streamCard.parentNode) streamCard.remove();
       smoothedDiv.innerHTML = epistemicCard('ERROR', e.message, { sublabel: 'helix generation failed' });
     }
     evolveParams(question, allSignals, false, paramSnapshot);
@@ -5150,13 +5289,14 @@ window.sanityCheck = async function() {
   setStatus('Sanity check: loading model…');
   try {
     if(!llmEngine) await initWebLLM();
-    setStatus('Sanity check: sending test call…');
+    setStatus('Sanity check: streaming test call…');
     const t0 = Date.now();
-    const reply = await llmEngine.chat.completions.create({
+    const raw = (await streamWebLLM(llmEngine, {
       messages:[{role:'user',content:'Reply with only: {"q1":1,"q2":3,"q3":2,"fn":"test"}'}],
       max_tokens: 30, temperature: 0.1,
-    });
-    const raw = (reply.choices[0]?.message?.content || '').trim();
+    }, (full) => {
+      setStatus(`… ${full.slice(0, 60)}`);
+    }) || '').trim();
     const ms = Date.now() - t0;
     setStatus(`✓ Model responded in ${ms}ms: "${raw.slice(0,60)}"`);
   } catch(e) {

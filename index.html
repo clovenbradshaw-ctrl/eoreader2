@@ -1046,6 +1046,293 @@ function extractClause(text, corefStack, globalSeenKinds) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  Mechanical binding extraction — typed (op, site, stance, subj, pred, obj)
+//  Parallel channel to claims. First-draft, regex/heuristic only.
+//  Produces the slot-level facts the reading model is meant to recover:
+//    DEF(Entity, Binding) fox.name = "Basil"
+//    CON(Link,   Binding) fox ≡ Basil
+//    DEF(Entity, Tending) fox.weight = 13.7 lb
+//    CON(Link,   Tracing) Lovett --said--> "..."
+// ═══════════════════════════════════════════════════════════
+
+// Common-noun heads that count as referent-able entities even without
+// proper-noun NER. Keep small; the genre tagger can extend it later.
+const COMMON_NOUN_HEADS = new Set([
+  'fox','dog','cat','bird','horse','animal','wolf','bear','lion','tiger',
+  'man','woman','child','boy','girl','suspect','victim','officer','official','spokesperson',
+  'zoo','hospital','school','company','agency','department','court','police',
+  'ship','car','plane','train','vessel','vehicle',
+  'city','town','village','country','river','island','port','cave',
+  'parasite','disease','virus','treatment','medication','condition',
+  'book','film','study','report','case','incident','event','meeting',
+]);
+
+// Stance cues — temporal/aspectual markers that promote Binding to a richer aspect.
+const STANCE_CUES = [
+  { rx: /\b(?:has|have|had)\s+\w+ed\b/i,                   stance: 'Tracing' },     // present perfect → trajectory
+  { rx: /\b(?:currently|at the moment|right now|today|now)\b/i, stance: 'Tending' }, // current state
+  { rx: /\bover\s+(?:months|years|weeks|decades|the\s+past)\b/i, stance: 'Tracing' },// longitudinal
+  { rx: /\b(?:gained|grown|lost|improved|worsened|increased|decreased|developed)\b/i, stance: 'Tracing' },
+  { rx: /\b(?:was|were)\s+(?:born|founded|established|created|built|made)\b/i, stance: 'Making' },
+  { rx: /\b(?:emerging|developing|preparing|approaching|becoming)\b/i, stance: 'Cultivating' },
+];
+
+function detectStance(span, fallback) {
+  for(const cue of STANCE_CUES) if(cue.rx.test(span)) return cue.stance;
+  return fallback;
+}
+
+// Pull common-noun head referents out of a clause: "the 2-year-old English fox" -> 'fox'.
+// Returns array of { head, span } for any (the|a|an|this|his|her|its|their) NN+ phrase
+// whose head is in COMMON_NOUN_HEADS.
+function extractHeadReferents(text) {
+  const out = [];
+  // Scan for any token that's a known common-noun head, then look back for a determiner
+  // within a small window. Avoids greedy modifier-slot bugs.
+  const DET = /\b(the|a|an|this|that|these|those|his|her|its|their|our|my)\b/i;
+  const tokenRe = /\b([A-Za-z][\w'-]*)\b/g;
+  let m;
+  while((m = tokenRe.exec(text)) !== null) {
+    const word = m[1];
+    const lower = word.toLowerCase();
+    const singular = lower.replace(/s$/, '');
+    const head = COMMON_NOUN_HEADS.has(lower) ? lower
+               : (COMMON_NOUN_HEADS.has(singular) ? singular : null);
+    if(!head) continue;
+    // Look back up to ~40 chars for a determiner.
+    const back = text.slice(Math.max(0, m.index - 40), m.index);
+    const dm = back.match(new RegExp(DET.source + '(?:[^.;]*)$', 'i'));
+    if(!dm) continue;
+    // span = from determiner start to head end
+    const detPos = m.index - (back.length - back.lastIndexOf(dm[0]));
+    out.push({
+      head,
+      span: text.slice(detPos, m.index + word.length),
+      det: dm[1].toLowerCase(),
+      position: m.index,
+    });
+  }
+  // Dedupe by head, keep latest
+  const seen = new Map();
+  for(const h of out) seen.set(h.head, h);
+  return [...seen.values()];
+}
+
+// Resolve "the X" against the most-recent common-noun head of type X in the stack,
+// or against any proper-name coref if the head matches a known entity's kind.
+function resolveDefiniteNP(head, headStack, knownEntities) {
+  for(let i = headStack.length - 1; i >= 0; i--) {
+    if(headStack[i].head === head) return headStack[i].canonical || head;
+  }
+  return head; // fall back to the bare head as entity key
+}
+
+function pushBinding(out, b) {
+  if(!b.subject || !b.object) return;
+  if(String(b.subject).toLowerCase() === String(b.object).toLowerCase()) return;
+  out.push({
+    op: b.op, site: b.site, stance: b.stance,
+    subject: String(b.subject).trim(),
+    subjectDisplay: b.subjectDisplay || b.subject,
+    predicate: b.predicate || null,
+    object: String(b.object).trim(),
+    span: (b.span || '').slice(0, 160),
+    clauseIndex: b.clauseIndex,
+    source: b.source || 'mechanical',
+    confidence: b.confidence ?? 0.7,
+  });
+}
+
+const PRONOUN_START = /^\s*(He|She|It|They|His|Her|Their|Its|Him|Them)\b/;
+
+// Pick the most likely subject for a pattern whose verb starts at `at` in `text`.
+//   1. If the clause starts with a pronoun → most recent named referent (corefStack[0]).
+//   2. Else the rightmost head before `at` (closest head to the verb).
+//   3. Else the leftmost head in the clause (matrix subject heuristic).
+//   4. Else corefStack[0].
+function pickSubject(text, headsInClause, corefStack, at) {
+  if(PRONOUN_START.test(text) && corefStack[0]) return corefStack[0];
+  if(typeof at === 'number') {
+    const before = headsInClause.filter(h => h.position < at);
+    if(before.length) return before[before.length-1].head;
+  }
+  if(headsInClause.length) return headsInClause[0].head;
+  if(corefStack[0]) return corefStack[0];
+  return null;
+}
+
+// Trim a captured object phrase at the first comma/clause boundary.
+function trimObject(s) {
+  if(!s) return s;
+  return s.split(/[,;.](?:\s|$)/)[0].replace(/\s+at\s+the\s+end\s+of.*$/i,'').trim();
+}
+
+// Main entry. corefStack is the existing proper-noun coref stack from extractClause.
+// headStack is a parallel stack of recent common-noun heads (we maintain it caller-side).
+function extractBindings(text, corefStack, headStack, clauseIndex, claims) {
+  const out = [];
+  const t = text.replace(/\s+/g, ' ').trim();
+  const headsInClause = extractHeadReferents(t);
+
+  // 1. Name reveal: "named X" / "called X" / "given a name: X".
+  //    Subject = leftmost head in clause (matrix subject; the named referent is what the
+  //    sentence is about, which is usually its first head noun).
+  const nameP = /\b(?:named|called|dubbed|baptized|christened|given\s+(?:a|the)\s+name(?:\s*:)?)\s+["“']?([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)?)["”']?/g;
+  let m;
+  while((m = nameP.exec(t)) !== null) {
+    const name = m[1].trim();
+    const subject = headsInClause[0]?.head || pickSubject(t, headsInClause, corefStack, m.index);
+    if(!subject) continue;
+    pushBinding(out, {
+      op:'DEF', site:'Entity', stance:'Binding',
+      subject, predicate:'name', object:name,
+      span:m[0], clauseIndex, source:'mech:name-reveal', confidence:0.9,
+    });
+    pushBinding(out, {
+      op:'CON', site:'Link', stance:'Binding',
+      subject, predicate:'≡', object:name,
+      span:m[0], clauseIndex, source:'mech:coref-name', confidence:0.8,
+    });
+  }
+
+  // 2. Age: "2-year-old <head>" or "<head> ... 5 years old". Attach to closest head.
+  const ageP = /\b(\d+)[\s-]?year[s-]?old\b|\b(\d+)\s+years?\s+old\b/gi;
+  while((m = ageP.exec(t)) !== null) {
+    const yrs = m[1] || m[2];
+    // Look forward up to 30 chars for a head ("2-year-old fox"), else back.
+    const forward = headsInClause.find(h => h.position >= m.index && h.position - m.index < 40);
+    const back    = [...headsInClause].reverse().find(h => h.position < m.index && m.index - h.position < 40);
+    const subject = forward?.head || back?.head || pickSubject(t, headsInClause, corefStack, m.index);
+    if(!subject) continue;
+    pushBinding(out, {
+      op:'DEF', site:'Entity', stance:'Binding',
+      subject, predicate:'age', object:`${yrs} years`,
+      span:m[0], clauseIndex, source:'mech:age', confidence:0.9,
+    });
+  }
+
+  // 3. Measurements: weight, duration. Subject = pronoun-resolved or most recent named referent.
+  const measP = /\b(\d+(?:\.\d+)?)\s*(pounds?|lbs?|kilograms?|kg|miles?|km|hours?|minutes?|days?|weeks?|months?|years?)\b/gi;
+  while((m = measP.exec(t)) !== null) {
+    const unit = m[2].toLowerCase().replace(/s$/, '');
+    const isWeight = /\b(?:pounds?|lbs?|kilograms?|kg)\b/i.test(m[0]);
+    const isDur    = /\b(?:hours?|minutes?|days?|weeks?|months?|years?)\b/i.test(m[0]);
+    if(/year/i.test(m[2])) continue; // years usually covered by ageP
+    const predicate = isWeight ? 'weight' : (isDur ? 'duration' : 'measurement');
+    const subject = pickSubject(t, headsInClause, corefStack, m.index);
+    if(!subject) continue;
+    const stance = detectStance(t, 'Tending');
+    pushBinding(out, {
+      op:'DEF', site:'Entity', stance,
+      subject, predicate, object:`${m[1]} ${unit}`,
+      span:m[0], clauseIndex, source:'mech:measurement', confidence:0.8,
+    });
+  }
+
+  // 4. Appositive role: "Keith Lovett, vice president and director ..."
+  const roleNouns = /\b(?:president|director|chief|head|founder|ceo|cto|cfo|secretary|chair|chairman|chairwoman|professor|doctor|judge|senator|representative|governor|mayor|spokesperson|spokeswoman|spokesman|manager|officer|coordinator|vice\s+president)\b/i;
+  const apposP = /\b([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)+)\s*,\s+([^,.;]{6,120}?)(?=,\s+(?:said|told|wrote|stated|announced)|\.|$|,\s+but\b|,\s+and\b)/g;
+  while((m = apposP.exec(t)) !== null) {
+    const subj = m[1].trim();
+    const role = m[2].trim();
+    if(roleNouns.test(role)) {
+      pushBinding(out, {
+        op:'DEF', site:'Entity', stance:'Binding',
+        subject:subj, predicate:'role', object:role,
+        span:m[0], clauseIndex, source:'mech:appos-role', confidence:0.8,
+      });
+    }
+  }
+
+  // 5. Speech: "X said/told/..."
+  const speechP = /\b([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)?)\s+(said|told|stated|announced|declared|wrote|explained|warned|claimed|noted|added)\b/g;
+  while((m = speechP.exec(t)) !== null) {
+    pushBinding(out, {
+      op:'CON', site:'Link', stance:'Tracing',
+      subject:m[1].trim(), predicate:m[2].toLowerCase(), object:'(quoted speech)',
+      span:m[0], clauseIndex, source:'mech:speech', confidence:0.85,
+    });
+  }
+
+  // 6a. Active care verb: "ACTOR took <patient> into its care"
+  //     Subject = the head/proper appearing before "took". Object = m[2] (the patient).
+  const careTookP = /\b(took)\s+(?:the\s+)?([^.;,]{3,50}?)\s+into\s+(?:its|their|his|her)\s+care\b/i;
+  m = careTookP.exec(t);
+  if(m) {
+    const actor = pickSubject(t.slice(0, m.index), headsInClause.filter(h=>h.position<m.index), corefStack, m.index);
+    let patient = trimObject(m[2]);
+    // patient is a phrase like "the 2-year-old English fox"; try to reduce to head
+    const patientHead = extractHeadReferents(patient)[0]?.head || patient;
+    if(actor && patientHead && actor !== patientHead) {
+      pushBinding(out, {
+        op:'CON', site:'Link', stance:'Binding',
+        subject:actor, predicate:'cares_for', object:patientHead,
+        span:m[0], clauseIndex, source:'mech:verb:cares_for', confidence:0.8,
+      });
+    }
+  }
+
+  // 6b. Passive interception: "PATIENT was secured/intercepted/caught by AGENT"
+  const passiveP = /\b(?:was|were|been)\s+(secured|intercepted|detained|stopped|caught|arrested|treated|rescued)\s+(by|for|from)\s+([^.;,]{2,60})/i;
+  m = passiveP.exec(t);
+  if(m) {
+    const verb = m[1].toLowerCase();
+    const prep = m[2].toLowerCase();
+    const agent = trimObject(m[3]);
+    // Patient finding:
+    //   - If a pronoun is immediately before the verb ("he was secured"), defer to coref/pickSubject.
+    //   - Else look back ~60 chars for a multi-letter proper noun (handles appositives like
+    //     "Basil, which rhymes with dazzle, was treated for ...").
+    let patient = null;
+    const tailWord = t.slice(Math.max(0, m.index - 12), m.index).match(/\b(\w+)\W*$/)?.[1] || '';
+    const pronounImmediate = /^(he|she|it|they|him|her|them)$/i.test(tailWord);
+    if(!pronounImmediate) {
+      const back = t.slice(Math.max(0, m.index - 60), m.index);
+      const STOPWORDS = /^(The|That|This|These|Those|And|But|Or|For|With|From|By|In|On|At|To|Of|A|An|He|She|It|They|His|Her|Their|Its|English|French|American|British|German|Italian|Spanish|Russian|Chinese|Japanese|European|African|Asian|Indian|Mexican|Canadian|Australian|January|February|March|April|May|June|July|August|September|October|November|December|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)$/;
+      const properMatches = [...back.matchAll(/\b([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)*)\b/g)]
+        .map(mm => mm[1]).filter(n => !STOPWORDS.test(n));
+      if(properMatches.length) patient = properMatches[properMatches.length - 1];
+    }
+    if(!patient) patient = pickSubject(t.slice(0, m.index), headsInClause.filter(h=>h.position<m.index), corefStack, m.index);
+    if(patient && agent) {
+      const pred = (verb === 'treated' && prep === 'for') ? 'treated_for'
+                 : (verb === 'rescued' && prep === 'by')  ? 'rescued_by'
+                 : `${verb}_${prep}`;
+      pushBinding(out, {
+        op:'CON', site:'Link', stance:'Binding',
+        subject:patient, predicate:pred, object:agent,
+        span:m[0], clauseIndex, source:`mech:verb:${pred}`, confidence:0.75,
+      });
+    }
+  }
+
+  // 7. Origin: "from <Place>" — attach to subject near the "from" position.
+  const fromP = /\bfrom\s+([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)*(?:,\s+[A-Z][\w'-]+)?)/g;
+  while((m = fromP.exec(t)) !== null) {
+    const subject = pickSubject(t, headsInClause, corefStack, m.index);
+    if(subject) pushBinding(out, {
+      op:'DEF', site:'Entity', stance:'Binding',
+      subject, predicate:'origin', object:m[1].trim(),
+      span:m[0], clauseIndex, source:'mech:origin', confidence:0.6,
+    });
+  }
+
+  // 8. Kind-level mechanism: "X infects/causes/produces Y" (no determiner on subject).
+  const kindDefP = /(?:^|[.;]\s+|but\s+)([A-Z]?[a-z][\w\s-]{2,40}?)\s+(infects?|causes?|produces?|prevents?|enables?|leads?\s+to)\s+([a-z][^.;,]{2,80})/g;
+  while((m = kindDefP.exec(t)) !== null) {
+    const subj = m[1].trim(), verb = m[2].toLowerCase(), obj = trimObject(m[3]);
+    if(subj.split(/\s+/).length > 5) continue;
+    pushBinding(out, {
+      op:'DEF', site:'Kind', stance:'Composing',
+      subject:subj, predicate:verb.replace(/\s+/g, '_'), object:obj,
+      span:m[0], clauseIndex, source:'mech:kind-mechanism', confidence:0.6,
+    });
+  }
+
+  return out;
+}
+
+// ═══════════════════════════════════════════════════════════
 //  Salience, triggers, hashing
 // ═══════════════════════════════════════════════════════════
 
@@ -1281,7 +1568,7 @@ function siteHash(claims){
 //  Main processing
 // ═══════════════════════════════════════════════════════════
 
-const graph = { entities:{}, claims:[], clauses:[], vectors:{}, folds:{}, computedFolds:{}, merges:[], events:[], documents:[] };
+const graph = { entities:{}, claims:[], bindings:[], clauses:[], vectors:{}, folds:{}, computedFolds:{}, merges:[], events:[], documents:[] };
 let currentDocId = null;
 function setCurrentDoc(source) {
   currentDocId = source.startsWith('http') ? source.replace(/https?:\/\/(www\.)?/,'').split(/[?#]/)[0].slice(0,60) : `pasted-${Date.now()}`;
@@ -1493,10 +1780,11 @@ async function processText(text) {
   text = cleanText(text);
   const clauses = splitClauses(text);
   const corefStack = [];
+  const headStack = [];   // recent common-noun head referents ("the fox" -> {head:'fox', ...})
   allResults = [];
   register = { frames:[], history:[], clauseVecs:[], baselineDrift:0.10 };
   propositions = [];
-  graph.entities = {}; graph.claims = []; graph.clauses = []; graph.vectors = {}; graph.folds = {};
+  graph.entities = {}; graph.claims = []; graph.bindings = []; graph.clauses = []; graph.vectors = {}; graph.folds = {};
   // Reset cursor + diff state for the evolving graph view
   window._lastEntityState = new Map();
   if(window._spanCursor) window._spanCursor.clauseIndex = null;
@@ -1547,6 +1835,18 @@ async function processText(text) {
     register.clauseVecs.push({index:i,vec:clauseVec});
 
     const extraction = extractClause(clause, corefStack, globalSeenKinds);
+
+    // Refresh head-referent stack from this clause (e.g. "the fox" -> {head:'fox'})
+    const newHeads = extractHeadReferents(clause);
+    for(const h of newHeads) {
+      const idx = headStack.findIndex(x => x.head === h.head);
+      if(idx > -1) headStack.splice(idx, 1);
+      headStack.push({ ...h, clauseIndex: i });
+    }
+    while(headStack.length > 8) headStack.shift();
+
+    // Mechanical binding extraction (typed slot/edge facts; parallel to claims)
+    const newBindings = extractBindings(clause, corefStack, headStack, i, extraction.claims);
 
     // Track entity first mentions for positional operator assignment
     for(const claim of extraction.claims) {
@@ -1627,6 +1927,52 @@ async function processText(text) {
         });
         graph.entities[key].mentions.push(i);
         graph.claims.push(graph.entities[key].claims[graph.entities[key].claims.length-1]);
+      }
+    }
+
+    // Mechanical bindings → graph + per-entity. Promotes common-noun heads
+    // (the fox, the zoo) and previously-missed proper nouns to first-class entities.
+    for(const b of newBindings) {
+      const skey = (b.subject || '').toLowerCase();
+      if(!skey) continue;
+      if(!graph.entities[skey]) {
+        const isCommon = COMMON_NOUN_HEADS.has(skey);
+        graph.entities[skey] = {
+          name: b.subjectDisplay || b.subject,
+          terrain: 'Entity', claims: [], edges: [], mentions: [],
+          ledgers: {}, bindings: [], slots: {},
+          stage: 'extracted',
+          commonNoun: isCommon,
+          fromBinding: !isCommon,  // mark proper nouns promoted only by bindings
+        };
+        emit('INS', 'Entity', 'Cultivating', b.subject,
+             isCommon ? 'common-noun-head' : 'binding-subject', i);
+      }
+      const ent = graph.entities[skey];
+      if(!ent.bindings) ent.bindings = [];
+      if(!ent.slots) ent.slots = {};
+      ent.bindings.push(b);
+      ent.mentions.push(i);
+      // Flat slots map for DEF/Entity bindings — what entity.<predicate> = <object> looks like
+      if(b.op === 'DEF' && b.site === 'Entity' && b.predicate) {
+        ent.slots[b.predicate] = b.object;
+      }
+      graph.bindings.push(b);
+      emit(b.op, b.site, b.stance, `${b.subject}.${b.predicate || '?'}`, b.object, i);
+
+      // If this binding is a name-reveal coref, alias the proper-noun entity to the head entity.
+      if(b.source === 'mech:coref-name' && b.op === 'CON' && b.predicate === '≡') {
+        const okey = (b.object || '').toLowerCase();
+        if(okey && okey !== skey) {
+          if(!graph.merges) graph.merges = [];
+          const dup = graph.merges.some(m => m.short === b.object && m.full === ent.name);
+          if(!dup) graph.merges.push({
+            short: b.object, full: ent.name,
+            clauseIndex: i, ts: new Date().toISOString(), mechanical: true, source: 'binding'
+          });
+          if(!ent.aliases) ent.aliases = [];
+          if(!ent.aliases.includes(b.object)) ent.aliases.push(b.object);
+        }
       }
     }
 
@@ -5125,7 +5471,7 @@ async function exportLog() {
   lines.push(hr);
   lines.push('SUMMARY');
   lines.push(hr);
-  lines.push(`${graph.clauses.length} clauses · ${Object.keys(graph.entities).length} entities · ${graph.claims.length} claims · ${propositions.length} propositions`);
+  lines.push(`${graph.clauses.length} clauses · ${Object.keys(graph.entities).length} entities · ${graph.claims.length} claims · ${(graph.bindings||[]).length} bindings · ${propositions.length} propositions`);
   lines.push(`${register.frames.length} frames · ${register.history.length} frame events`);
   const chromeExportCount = allResults.filter(r=>r.rawType==='chrome').length;
   lines.push(`${chromeExportCount} chrome · ${inertCount} inert · ${revivedCount} revived · ${flaggedCount} flagged`);
@@ -5172,6 +5518,21 @@ async function exportLog() {
 
     if(ent.aliases && ent.aliases.length > 0) {
       lines.push(`  aliases: ${ent.aliases.join(', ')}`);
+    }
+
+    if(ent.slots && Object.keys(ent.slots).length > 0) {
+      lines.push(`  slots:`);
+      for(const[k,v] of Object.entries(ent.slots)) {
+        lines.push(`    ${k}: ${String(v).slice(0,80)}`);
+      }
+    }
+
+    if(ent.bindings && ent.bindings.length > 0) {
+      lines.push(`  bindings (${ent.bindings.length}):`);
+      for(const b of ent.bindings) {
+        const pred = b.predicate ? `.${b.predicate}` : '';
+        lines.push(`    ${b.op}(${b.site}, ${b.stance})  ${b.subject}${pred} = ${String(b.object).slice(0,60)}  c${b.clauseIndex+1}  [${b.source}]`);
+      }
     }
 
     if(ent.ledgers && Object.keys(ent.ledgers).length > 0) {
@@ -5528,10 +5889,17 @@ async function exportLog() {
     counts: {
       entities: Object.keys(graph.entities).length,
       claims: graph.claims.length,
+      bindings: (graph.bindings || []).length,
       clauses: graph.clauses.length,
       propositions: propositions.length,
       frames: register.frames.length,
     },
+    bindings: (graph.bindings || []).map(b => ({
+      op:b.op, site:b.site, stance:b.stance,
+      subject:b.subject, predicate:b.predicate, object:b.object,
+      clauseIndex:b.clauseIndex, source:b.source, confidence:b.confidence,
+      span:b.span,
+    })),
     entities: {},
     clauses: graph.clauses,
     frames: register.frames.map(f => ({
@@ -5553,6 +5921,12 @@ async function exportLog() {
   for(const[key,ent] of Object.entries(graph.entities)) {
     exportGraph.entities[key] = {
       name:ent.name, isLink:ent.isLink||false, aliases:ent.aliases||[],
+      slots: ent.slots || {},
+      bindings: (ent.bindings || []).map(b => ({
+        op:b.op, site:b.site, stance:b.stance,
+        predicate:b.predicate, object:b.object,
+        clause:b.clauseIndex, source:b.source, confidence:b.confidence,
+      })),
       claims:ent.claims.map(c=>({
         op:c.operator, site:c.site, stance:c.resolution,
         type:c.rawType, value:c.value, clause:c.clauseIndex,

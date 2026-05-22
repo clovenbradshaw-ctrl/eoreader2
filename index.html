@@ -428,6 +428,99 @@ button.read-btn { background: var(--violet); }
   .app { padding: 12px; }
   .clause-body { font-size: 13px; }
 }
+
+/* Graph cursors strip */
+#graph-cursors {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+  padding: 6px 4px 8px; margin-bottom: 8px;
+}
+.cursor-row { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10px; }
+.cursor-label { color: var(--dim); width: 48px; flex-shrink: 0; }
+.cursor-body { flex: 1; min-width: 0; }
+#span-cursor {
+  color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  background: var(--surface2); padding: 3px 6px; border-radius: 3px;
+  border-left: 2px solid var(--dim); cursor: pointer;
+}
+#span-cursor.src-chat   { border-left-color: var(--accent); }
+#span-cursor.src-walk   { border-left-color: var(--violet); }
+#span-cursor.src-read   { border-left-color: var(--green); }
+#span-cursor.src-ingest { border-left-color: var(--amber); }
+
+.cursor-toggles { display: flex; gap: 3px; }
+.src-chip {
+  background: none; border: 1px solid var(--border); color: var(--dim);
+  padding: 2px 6px; border-radius: 8px; font-size: 9px; font-family: var(--mono);
+  cursor: pointer; line-height: 1.2;
+}
+.src-chip.on { color: var(--text); }
+.src-chip.on[data-src="chat"]   { border-color: var(--accent); color: var(--accent); }
+.src-chip.on[data-src="walk"]   { border-color: var(--violet); color: var(--violet); }
+.src-chip.on[data-src="read"]   { border-color: var(--green);  color: var(--green); }
+.src-chip.on[data-src="ingest"] { border-color: var(--amber);  color: var(--amber); }
+
+#comp-cursor { display: flex; height: 12px; border-radius: 2px; overflow: hidden; background: var(--surface2); }
+#comp-cursor .stage {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 8px; color: rgba(0,0,0,0.7); overflow: hidden;
+  transition: width 0.4s ease;
+}
+.stage-extracted { background: #4b5563; color: #d1d5db; }
+.stage-walked    { background: #a78bfa; }
+.stage-mini-read { background: #f59e0b; }
+.stage-read      { background: #22c55e; }
+.stage-folded    { background: #06b6d4; }
+
+/* Node-type tag (terrain) on entity card */
+.entity-terrain {
+  display: inline-block; font-size: 9px; font-family: var(--mono);
+  padding: 1px 5px; border-radius: 2px; margin-right: 6px;
+  border: 1px solid; line-height: 1.4; letter-spacing: 0.02em;
+}
+.t-Void       { color: #6b7280; border-color: #6b7280; }
+.t-Entity     { color: #3b82f6; border-color: #3b82f6; }
+.t-Kind       { color: #06b6d4; border-color: #06b6d4; }
+.t-Field      { color: #f97316; border-color: #f97316; }
+.t-Link       { color: #22c55e; border-color: #22c55e; }
+.t-Network    { color: #a78bfa; border-color: #a78bfa; }
+.t-Atmosphere { color: #eab308; border-color: #eab308; }
+.t-Lens       { color: #ef4444; border-color: #ef4444; }
+.t-Paradigm   { color: #ec4899; border-color: #ec4899; }
+
+/* Edges sub-line */
+.entity-edges {
+  padding: 4px 10px 6px; font-family: var(--mono); font-size: 10px;
+  color: var(--dim); border-bottom: 1px solid var(--border);
+}
+.entity-edges .edge {
+  display: inline-block; margin-right: 8px; cursor: pointer;
+  color: var(--text);
+}
+.entity-edges .edge:hover { color: var(--accent); }
+.entity-edges .edge-count { color: var(--dim); font-size: 9px; }
+
+/* Recency pulse */
+@keyframes cardPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(111,163,247,0.6); }
+  60%  { box-shadow: 0 0 0 6px rgba(111,163,247,0); }
+  100% { box-shadow: 0 0 0 0 rgba(111,163,247,0); }
+}
+.entity-card.card-pulse { animation: cardPulse 0.8s ease-out; }
+
+/* Stage badge on entity card */
+.entity-stage {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  margin-right: 4px; vertical-align: middle;
+}
+.entity-stage.stage-extracted { background: #4b5563; }
+.entity-stage.stage-walked    { background: #a78bfa; }
+.entity-stage.stage-mini-read { background: #f59e0b; }
+.entity-stage.stage-read      { background: #22c55e; }
+.entity-stage.stage-folded    { background: #06b6d4; }
+
+/* Walked clause marker in evidence */
+.walked-marker { color: var(--violet); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -498,7 +591,28 @@ button.read-btn { background: var(--violet); }
       <div id="doc-detail" style="display:none"></div>
     </div>
     <div id="clauses" class="panel scroll-panel" style="max-height:calc(100vh - 120px);overflow-y:auto"></div>
-    <div id="graph" class="panel scroll-panel" style="max-height:calc(100vh - 120px);overflow-y:auto"></div>
+    <div id="graph" class="panel scroll-panel" style="max-height:calc(100vh - 120px);overflow-y:auto">
+      <div id="graph-cursors">
+        <div class="cursor-row" style="margin-bottom:6px">
+          <span class="cursor-label">span</span>
+          <div class="cursor-body"><div id="span-cursor" onclick="window._spanCursor &amp;&amp; window._spanCursor.clauseIndex !== null &amp;&amp; window.scrollToClause(window._spanCursor.clauseIndex)">— no source active —</div></div>
+        </div>
+        <div class="cursor-row" style="margin-bottom:6px">
+          <span class="cursor-label">sources</span>
+          <div class="cursor-body cursor-toggles" id="span-source-toggles">
+            <button class="src-chip on"  data-src="chat"   onclick="window.toggleSpanSource('chat')">chat</button>
+            <button class="src-chip on"  data-src="walk"   onclick="window.toggleSpanSource('walk')">walk</button>
+            <button class="src-chip on"  data-src="read"   onclick="window.toggleSpanSource('read')">read</button>
+            <button class="src-chip off" data-src="ingest" onclick="window.toggleSpanSource('ingest')">ingest</button>
+          </div>
+        </div>
+        <div class="cursor-row">
+          <span class="cursor-label">stage</span>
+          <div class="cursor-body"><div id="comp-cursor"></div></div>
+        </div>
+      </div>
+      <div id="graph-entities"></div>
+    </div>
     <div id="register" class="panel scroll-panel" style="max-height:calc(100vh - 120px);overflow-y:auto"></div>
     <div id="readings" class="panel scroll-panel" style="max-height:calc(100vh - 120px);overflow-y:auto"></div>
   </div>
@@ -1341,6 +1455,9 @@ async function processText(text) {
   register = { frames:[], history:[], clauseVecs:[], baselineDrift:0.10 };
   propositions = [];
   graph.entities = {}; graph.claims = []; graph.clauses = []; graph.vectors = {}; graph.folds = {};
+  // Reset cursor + diff state for the evolving graph view
+  window._lastEntityState = new Map();
+  if(window._spanCursor) window._spanCursor.clauseIndex = null;
   let frameCounter = 0;
   const globalSeenKinds = new Set();
 
@@ -1380,7 +1497,7 @@ async function processText(text) {
       allResults.push({clauseIndex:i,clause,entity:'(chrome)',value:'',span:clause,
         rawType:'chrome',salience:sal,chromeReason:'pattern',chromeHash,quoteState,
         operator:{name:'—'},terrain:{name:'—'},stance:{name:'—'},frameEvents:[],claims:[]});
-      graph.clauses.push({index:i,text:clause,salience:sal});
+      graph.clauses.push({index:i,text:clause,salience:sal,terrain:'Void',stage:'extracted',skip:true});
       continue;
     }
 
@@ -1424,14 +1541,14 @@ async function processText(text) {
       allResults.push({clauseIndex:i,clause,entity:'(chrome)',value:'',span:clause,
         rawType:'chrome',salience:sal,chromeReason:'structural',chromeHash,quoteState,
         operator:{name:'—'},terrain:{name:'—'},stance:{name:'—'},frameEvents:[],claims:[]});
-      graph.clauses.push({index:i,text:clause,salience:sal});
+      graph.clauses.push({index:i,text:clause,salience:sal,terrain:'Void',stage:'extracted',skip:true});
       continue;
     }
 
     if(sal < 0.12){
       allResults.push({clauseIndex:i,clause,entity:'(inert)',value:'',span:clause,rawType:'inert',salience:sal,
         operator:{name:'—'},terrain:{name:'—'},stance:{name:'—'},frameEvents:[],claims:[]});
-      graph.clauses.push({index:i,text:clause,salience:sal});
+      graph.clauses.push({index:i,text:clause,salience:sal,terrain:'Void',stage:'extracted',skip:true});
       continue;
     }
 
@@ -1457,7 +1574,7 @@ async function processText(text) {
       const key = claim.entity.toLowerCase();
       if(key&&key!=='?'&&!key.startsWith('(')){
         if(!graph.entities[key]) {
-          graph.entities[key]={name:claim.entity,terrain:cl.terrain.name,claims:[],edges:[],mentions:[],ledgers:{}};
+          graph.entities[key]={name:claim.entity,terrain:cl.terrain.name,claims:[],edges:[],mentions:[],ledgers:{},stage:'extracted'};
           emit('INS', cl.terrain.name, cl.stance.name, claim.entity, claim.rawType, i);
         }
         graph.entities[key].claims.push({
@@ -1468,6 +1585,27 @@ async function processText(text) {
         });
         graph.entities[key].mentions.push(i);
         graph.claims.push(graph.entities[key].claims[graph.entities[key].claims.length-1]);
+      }
+    }
+
+    // Co-occurrence edges — entities sharing this clause
+    const entitiesInClause = [...new Set(extraction.claims
+      .map(c => (c.entity||'').toLowerCase())
+      .filter(k => k && k !== '?' && !k.startsWith('(') && graph.entities[k]))];
+    const clauseTerrainGuess = (classifiedClaims[0]?.terrain?.name) || 'Entity';
+    for(let a = 0; a < entitiesInClause.length; a++) {
+      for(let b = a + 1; b < entitiesInClause.length; b++) {
+        const ka = entitiesInClause[a], kb = entitiesInClause[b];
+        const ea = graph.entities[ka], eb = graph.entities[kb];
+        const upsert = (host, otherKey, otherName) => {
+          let e = host.edges.find(x => x.key === otherKey);
+          if(!e) { e = { key: otherKey, name: otherName, count: 0, terrains: {}, clauses: [] }; host.edges.push(e); }
+          e.count++;
+          if(e.clauses.length < 12) e.clauses.push(i);
+          e.terrains[clauseTerrainGuess] = (e.terrains[clauseTerrainGuess] || 0) + 1;
+        };
+        upsert(ea, kb, eb.name);
+        upsert(eb, ka, ea.name);
       }
     }
 
@@ -1544,7 +1682,14 @@ async function processText(text) {
       mechanicalOp:op.name, claims:classifiedClaims, quoteState,
     });
 
-    graph.clauses.push({index:i,text:clause,salience:sal});
+    graph.clauses.push({index:i,text:clause,salience:sal,terrain:te.name,stage:'extracted'});
+
+    // Span cursor: track ingest head
+    if(typeof window.setSpanCursor === 'function') window.setSpanCursor(i, 'ingest');
+    // Incremental graph render so the page evolves visibly during ingest
+    if(i % 5 === 0 && typeof window.renderGraph === 'function') {
+      try { window.renderGraph(); } catch(e) {}
+    }
   }
 
   // Embed entities for retrieval
@@ -1993,6 +2138,11 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
     const hypPrev = paraHyp ? ` | "${paraHyp.slice(0,35)}…"` : '';
     setStatus(`c${r.clauseIndex+1} [${i+1}/${toRead.length}] ${pct}% ✓${confirmations} ✎${corrections} ⊘${skipped}${hypPrev}`);
     setProgress(i, toRead.length);
+    if(typeof window.setSpanCursor === 'function') window.setSpanCursor(r.clauseIndex, 'read');
+    // Re-render comprehension cursor periodically so the stage bar visibly advances
+    if(i % 5 === 0 && typeof renderComprehensionCursor === 'function') {
+      try { renderComprehensionCursor(); } catch(e) {}
+    }
 
     const hasTrigger = r.triggers && r.triggers.length > 0;
     if(hasTrigger && paraHyp && i > 3) {
@@ -2205,7 +2355,11 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
         r.fn = fn;
       } else {
         confirmations++;
+        r.confirmed = true;
       }
+      // Bump clause stage to 'read' (so the comprehension cursor advances)
+      const gc = graph.clauses.find(c => c.index === r.clauseIndex);
+      if(gc && gc.stage !== 'folded' && gc.stage !== 'read') gc.stage = 'read';
 
       const mechDepth = r.quoteState?.depth || 0;
       const mechSpeaker = r.quoteState?.detectedSpeaker || null;
@@ -2661,18 +2815,45 @@ function renderGraph(){
   let html='';
   const allSites=Object.keys(TERRAINS);
 
+  // Diff against previous render to detect grown entities for the pulse
+  const prevState = window._lastEntityState || new Map();
+  const nextState = new Map();
+
   for(const[key,ent] of sorted){
     const isLink=ent.isLink;
     const occupiedSites=Object.keys(ent.ledgers||{});
+    const terrain = ent.terrain || 'Entity';
+    const stage = ent.stage || 'extracted';
+    const claimCount = (ent.claims||[]).length;
+    const edgeCount = (ent.edges||[]).length;
 
-    html+=`<div class="entity-card ${isLink?'link-entity':''}">`;
-    html+=`<div class="entity-head" onclick="this.nextElementSibling.classList.toggle('open')">`;
-    html+=`<div><span class="entity-name">${esc(ent.name)}</span>`;
+    const prev = prevState.get(key);
+    const grew = !prev || prev.claims !== claimCount || prev.edges !== edgeCount || prev.stage !== stage;
+    nextState.set(key, { claims: claimCount, edges: edgeCount, stage });
+
+    html+=`<div class="entity-card ${isLink?'link-entity':''} ${grew?'card-pulse':''}" data-key="${esc(key)}">`;
+    html+=`<div class="entity-head" onclick="this.parentElement.querySelector('.ledger').classList.toggle('open')">`;
+    html+=`<div>`;
+    html+=`<span class="entity-stage stage-${stage}" title="stage: ${stage}"></span>`;
+    html+=`<span class="entity-terrain t-${terrain}" title="node type">${terrain}</span>`;
+    html+=`<span class="entity-name">${esc(ent.name)}</span>`;
     if(ent.aliases&&ent.aliases.length>0) html+=`<span class="entity-meta" style="color:var(--green)"> ≡ ${ent.aliases.map(esc).join(', ')}</span>`;
-    html+=`<span class="entity-meta"> · ${ent.claims.length} claims · ${(ent.mentions||[]).length} mentions</span></div>`;
+    html+=`<span class="entity-meta"> · ${claimCount} claims · ${(ent.mentions||[]).length} mentions · ${edgeCount} edges</span></div>`;
     html+=`<div class="entity-sites">`;
     for(const s of allSites) html+=`<div class="site-dot ${occupiedSites.includes(s)?'occupied':''}" title="${s}"></div>`;
     html+=`</div></div>`;
+
+    if((ent.edges||[]).length > 0) {
+      const topEdges = ent.edges.slice().sort((a,b)=>b.count-a.count).slice(0, 5);
+      html+=`<div class="entity-edges">↔ `;
+      html+= topEdges.map(e => {
+        const tt = Object.entries(e.terrains||{}).sort((a,b)=>b[1]-a[1])[0]?.[0] || '';
+        const tip = tt ? ` (${tt})` : '';
+        const safeKey = (e.key||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+        return `<span class="edge" onclick="event.stopPropagation(); window.scrollToEntityCard('${safeKey}')" title="${esc(e.name)}${tip}">${esc(e.name)} <span class="edge-count">×${e.count}</span></span>`;
+      }).join('');
+      html+=`</div>`;
+    }
 
     html+=`<div class="ledger">`;
     for(const[site,ledger] of Object.entries(ent.ledgers||{})){
@@ -2691,7 +2872,94 @@ function renderGraph(){
     }
     html+=`</div></div>`;
   }
-  document.getElementById('graph').innerHTML=html;
+
+  const target = document.getElementById('graph-entities') || document.getElementById('graph');
+  if(target) target.innerHTML = html;
+  window._lastEntityState = nextState;
+
+  renderComprehensionCursor();
+}
+window.renderGraph = renderGraph;
+
+// Two cursors for the graph view
+window._spanCursor = window._spanCursor || (() => {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('spanCursorSources') || '{}'); } catch(e) {}
+  const defaults = { chat: true, walk: true, read: true, ingest: false };
+  return {
+    clauseIndex: null,
+    sources: { ...defaults, ...saved },
+  };
+})();
+
+function setSpanCursor(clauseIndex, source) {
+  const sc = window._spanCursor;
+  if(!sc || !sc.sources[source]) return;
+  sc.clauseIndex = clauseIndex;
+  const el = document.getElementById('span-cursor');
+  if(!el) return;
+  const cl = graph.clauses.find(c => c.index === clauseIndex);
+  const snippet = (cl?.text || '').replace(/\s+/g,' ').slice(0, 90);
+  el.className = `src-${source}`;
+  el.textContent = `c${clauseIndex+1} · ${source} · ${snippet}`;
+  el.title = cl?.text || '';
+}
+window.setSpanCursor = setSpanCursor;
+
+function toggleSpanSource(src) {
+  const sc = window._spanCursor;
+  if(!sc) return;
+  sc.sources[src] = !sc.sources[src];
+  try { localStorage.setItem('spanCursorSources', JSON.stringify(sc.sources)); } catch(e) {}
+  document.querySelectorAll('.src-chip').forEach(chip => {
+    const s = chip.dataset.src;
+    chip.classList.toggle('on', !!sc.sources[s]);
+    chip.classList.toggle('off', !sc.sources[s]);
+  });
+}
+window.toggleSpanSource = toggleSpanSource;
+
+function renderComprehensionCursor() {
+  const el = document.getElementById('comp-cursor');
+  if(!el) return;
+  const contentClauses = graph.clauses.filter(c => !c.skip);
+  const total = contentClauses.length || 1;
+  const counts = { extracted: 0, walked: 0, 'mini-read': 0, read: 0, folded: 0 };
+  for(const c of contentClauses) {
+    const s = c.stage || 'extracted';
+    if(s in counts) counts[s]++;
+  }
+  // folded comes from entities, not clauses — show as smaller indicator if any
+  const foldedEntities = Object.values(graph.entities).filter(e => e.stage === 'folded').length;
+  const order = ['extracted','walked','mini-read','read'];
+  let html = '';
+  for(const s of order) {
+    const pct = (counts[s] / total) * 100;
+    if(pct < 0.1) continue;
+    html += `<span class="stage stage-${s}" style="width:${pct}%" title="${s}: ${counts[s]}/${total}">${pct > 8 ? s : ''}</span>`;
+  }
+  if(foldedEntities > 0) {
+    html += `<span class="stage stage-folded" style="width:auto;padding:0 4px" title="folded entities: ${foldedEntities}">⊕${foldedEntities}</span>`;
+  }
+  el.innerHTML = html || '<span style="color:var(--dim);font-size:9px;padding:2px 6px">no clauses yet</span>';
+}
+
+function scrollToEntityCard(key) {
+  const card = document.querySelector(`.entity-card[data-key="${CSS.escape(key)}"]`);
+  if(card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+window.scrollToEntityCard = scrollToEntityCard;
+
+// Sync chip on/off styles on first load
+if(window._spanCursor) {
+  const sc = window._spanCursor;
+  setTimeout(() => {
+    document.querySelectorAll('.src-chip').forEach(chip => {
+      const s = chip.dataset.src;
+      chip.classList.toggle('on', !!sc.sources[s]);
+      chip.classList.toggle('off', !sc.sources[s]);
+    });
+  }, 0);
 }
 
 function renderRegister(){
@@ -3115,6 +3383,13 @@ async function computeEntityFold(entityName, ent, streamEl, cursor) {
 
     for(const batch of batches) {
       for(const c of batch) log(`  c${c.index+1}: ${c.text.slice(0, 70)}`, 'color:var(--text);opacity:0.5');
+      // Span cursor: follow the walk
+      if(batch[0] && typeof window.setSpanCursor === 'function') window.setSpanCursor(batch[0].index, 'walk');
+      // Per-clause stage: 'walked' (unless already at 'read' or 'folded')
+      for(const c of batch) {
+        const gc = graph.clauses.find(gc => gc.index === c.index);
+        if(gc && gc.stage === 'extracted') gc.stage = 'walked';
+      }
 
       try {
         const batchText = batch.map(c => c.text.slice(0, 200)).join('\n');
@@ -3159,6 +3434,11 @@ async function computeEntityFold(entityName, ent, streamEl, cursor) {
   };
 
   graph.computedFolds[cursorKey] = fold;
+  // Bump entity stage to 'folded' so the comprehension cursor reflects depth
+  if(ent) ent.stage = 'folded';
+  for(const [k, e] of Object.entries(graph.entities)) {
+    if(resolveEntity(k) === canonical) e.stage = 'folded';
+  }
   emit('DEF', 'Entity', 'Tracing', `fold:${canonical}@${cursor||'end'}`, foldText.slice(0, 80));
 
   try {
@@ -3232,8 +3512,11 @@ async function horizon(question, opts = {}) {
   const readProgress = readIndices.size > 0 ? Math.max(...readIndices) : -1;
   const totalContent = contentClauses.length;
   const readFraction = readIndices.size / Math.max(totalContent, 1);
-  const readBonus = 1 + SEARCH_PARAMS.readBonusBase * (1 - readFraction);
-  const unreadPenalty = SEARCH_PARAMS.unreadFloor + (1 - SEARCH_PARAMS.unreadFloor) * readFraction;
+  // Posture: when reading is far from done, the graph IS the read.
+  // Don't penalize unread evidence — give it a small bonus (surprise weight).
+  const walking = readFraction < 0.6;
+  const unreadPenalty = walking ? (1.0 + 0.25 * (1 - readFraction)) : (SEARCH_PARAMS.unreadFloor + (1 - SEARCH_PARAMS.unreadFloor) * readFraction);
+  const readBonus    = walking ? 1.0 : (1 + SEARCH_PARAMS.readBonusBase * (1 - readFraction));
 
   let rankedClauses;
   if(qVec) {
@@ -3316,29 +3599,91 @@ async function horizon(question, opts = {}) {
     }
   }
 
+  // A2: synchronous on-demand folds for top entities the reader hasn't reached.
+  // A3: edge-driven co-occurrence walk — read ent.edges (populated at ingest)
+  // and pull top sibling spans into the evidence pool.
   const folds = [];
+  const foldProvenance = []; // { key, source: 'cached' | 'walked' | 'quick' }
   const entsNeedingFolds = [];
+  const FOLD_BUDGET_MS = 15000;
+  const MAX_ON_DEMAND_FOLDS = 3;
+  const foldStart = Date.now();
+
   for(const { key, ent } of relevantEntities) {
     const cached = graph.computedFolds[key];
     if(cached && cached.text) {
       folds.push(`${ent.name}: ${cached.text} [${(cached.trajectory||'').slice(0,60)}]`);
-    } else {
-      const claims = (ent.claims||[]).slice(0, 5);
-      const quickFold = claims.map(c => {
-        const text = (c.span||c.value||'').replace(new RegExp(ent.name,'gi'),'').trim().slice(0,60);
-        return text.length > 5 ? `[${c.operator||'?'}] ${text}` : null;
-      }).filter(Boolean).join('. ');
-      if(quickFold) folds.push(`${ent.name}: ${quickFold}`);
-      entsNeedingFolds.push({ key, ent });
+      foldProvenance.push({ key: ent.name, source: 'cached' });
+      continue;
     }
+    const mentions = ent.mentions || [];
+    const unreachedByReader = mentions.some(m => m > readProgress);
+    const walkedCount = foldProvenance.filter(p => p.source === 'walked').length;
+    const canBudget = (Date.now() - foldStart) < FOLD_BUDGET_MS && walkedCount < MAX_ON_DEMAND_FOLDS;
+    if(walking && unreachedByReader && canBudget && (typeof llmEngine !== 'undefined') && llmEngine) {
+      try {
+        const fold = await computeEntityFold(key, ent);
+        if(fold && fold.text) {
+          folds.push(`${ent.name}: ${fold.text}`);
+          foldProvenance.push({ key: ent.name, source: 'walked' });
+          continue;
+        }
+      } catch(e) {}
+    }
+    const claims = (ent.claims||[]).slice(0, 5);
+    const quickFold = claims.map(c => {
+      const text = (c.span||c.value||'').replace(new RegExp(ent.name,'gi'),'').trim().slice(0,60);
+      return text.length > 5 ? `[${c.operator||'?'}] ${text}` : null;
+    }).filter(Boolean).join('. ');
+    if(quickFold) {
+      folds.push(`${ent.name}: ${quickFold}`);
+      foldProvenance.push({ key: ent.name, source: 'quick' });
+    }
+    entsNeedingFolds.push({ key, ent });
   }
 
+  // Background-fill remaining folds for next time
   if(entsNeedingFolds.length > 0) {
     setTimeout(async () => {
       for(const { key, ent } of entsNeedingFolds) {
         try { await computeEntityFold(key, ent); } catch(e) {}
       }
     }, 100);
+  }
+
+  // A3: sibling entities via populated edges (or lazy intersection fallback)
+  const siblings = [];
+  const seedKeys = new Set(relevantEntities.map(re => re.key));
+  const edgeAgg = new Map(); // siblingKey -> { ent, count }
+  for(const { ent } of relevantEntities) {
+    for(const e of (ent.edges || [])) {
+      if(seedKeys.has(e.key)) continue;
+      const target = graph.entities[e.key];
+      if(!target) continue;
+      const cur = edgeAgg.get(e.key) || { ent: target, count: 0 };
+      cur.count += e.count;
+      edgeAgg.set(e.key, cur);
+    }
+  }
+  // Lazy fallback if edges aren't populated yet
+  if(edgeAgg.size === 0 && relevantEntities.length > 0) {
+    const seedSets = relevantEntities.map(re => ({ key: re.key, set: new Set(re.ent.mentions || []) }));
+    for(const [k, e] of Object.entries(graph.entities)) {
+      if(seedKeys.has(k) || k.length < 3 || GARBAGE_ENTITIES.test(k)) continue;
+      const m = e.mentions || [];
+      if(m.length < 2) continue;
+      let overlap = 0;
+      for(const idx of m) if(seedSets.some(s => s.set.has(idx))) overlap++;
+      if(overlap >= 2) edgeAgg.set(k, { ent: e, count: overlap });
+    }
+  }
+  const topSiblings = [...edgeAgg.entries()]
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 3)
+    .map(([k, v]) => v.ent);
+  for(const sib of topSiblings) {
+    const span = (sib.claims||[]).map(c => c.span).filter(Boolean)[0];
+    if(span) folds.push(`(co-occurring) ${sib.name}: ${span.slice(0, 100)}`);
   }
 
   let context = '';
@@ -3360,13 +3705,61 @@ async function horizon(question, opts = {}) {
     context += line; charBudget -= line.length;
   }
 
+  // A4: clause-neighborhood expansion — include prev/next clauses with each
+  // top-ranked evidence clause so the model sees the local context.
   context += '\nEvidence:\n';
   const evidenceClauses = [];
+  const includedIdx = new Set();
   for(const c of rankedClauses.slice(0, 8)) {
-    const line = `[c${c.index+1}] ${c.text.slice(0, 150)}\n`;
+    if(includedIdx.has(c.index)) continue;
+    const prev = graph.clauses.find(cl => cl.index === c.index - 1);
+    const next = graph.clauses.find(cl => cl.index === c.index + 1);
+    const neighborhood = [prev, c, next].filter(Boolean);
+    const marker = c.isRead ? '' : '*';
+    const line = `[c${c.index+1}${marker}±1] ` + neighborhood.map(n => (n.text||'').slice(0, 90)).join(' / ') + '\n';
     if(charBudget - line.length < 0) break;
     context += line; charBudget -= line.length;
     evidenceClauses.push(c);
+    neighborhood.forEach(n => includedIdx.add(n.index));
+  }
+
+  // A5: just-in-time mini-read of top unread evidence (LLM-classify before answering)
+  const miniReads = [];
+  if(walking && (typeof llmEngine !== 'undefined') && llmEngine) {
+    const MINI_READ_N = 3;
+    const MINI_READ_BUDGET_MS = 8000;
+    const miniStart = Date.now();
+    const unreadEvidence = evidenceClauses
+      .filter(c => !readIndices.has(c.index))
+      .slice(0, MINI_READ_N);
+    for(const c of unreadEvidence) {
+      if(Date.now() - miniStart > MINI_READ_BUDGET_MS) break;
+      try {
+        const prev = graph.clauses.find(cl => cl.index === c.index - 1);
+        const userMsg = (prev ? (prev.text||'').slice(0,80) + '\n' : '') + `>>> ${(c.text||'').slice(0,180)} <<<`;
+        const reply = await llmEngine.chat.completions.create({
+          messages: [
+            { role: 'system', content: 'Summarize the marked clause in 6 words. JSON only: {"fn":"<six words>"}' },
+            { role: 'user', content: userMsg },
+          ],
+          max_tokens: 50, temperature: 0.1,
+        });
+        const m = (reply.choices[0]?.message?.content || '').match(/\{[^}]+\}/);
+        if(m) {
+          let parsed;
+          try { parsed = JSON.parse(m[0]); } catch(e) { parsed = null; }
+          if(parsed?.fn) {
+            miniReads.push({ index: c.index, fn: String(parsed.fn).slice(0,60) });
+            const gc = graph.clauses.find(cl => cl.index === c.index);
+            if(gc && (gc.stage === 'extracted' || gc.stage === 'walked')) gc.stage = 'mini-read';
+          }
+        }
+      } catch(e) {}
+    }
+  }
+  for(const mr of miniReads) {
+    const line = `[c${mr.index+1} just-read] ${mr.fn}\n`;
+    if(charBudget - line.length >= 0) { context += line; charBudget -= line.length; }
   }
 
   return {
@@ -3374,6 +3767,10 @@ async function horizon(question, opts = {}) {
     clauses: evidenceClauses,
     entities: relevantEntities.map(e => e.ent),
     folds,
+    foldProvenance,
+    miniReads,
+    siblings: topSiblings.map(s => s.name),
+    walking,
     section: bestSection,
     docHypothesis: graph.hypotheses?.doc,
   };
@@ -3797,7 +4194,7 @@ async function askQuestion(directText) {
   try {
     projection = await Promise.race([
       horizon(resolvedQuestion),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('horizon timeout')), 8000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error('horizon timeout')), 25000))
     ]);
   } catch(e) {
     const fallback = docHyp || 'Still processing. Try again in a moment.';
@@ -3808,6 +4205,17 @@ async function askQuestion(directText) {
   }
 
   if(abort.aborted) return;
+
+  // A6: narrate the walk and pin the span cursor to the top evidence clause
+  if(projection.walking) {
+    const wf = (projection.foldProvenance || []).filter(p => p.source === 'walked').length;
+    const mr = (projection.miniReads || []).length;
+    const sb = (projection.siblings || []).length;
+    updateLastChat('system', `Walking graph (${wf} folds, ${mr} mini-reads, ${sb} siblings)…`);
+  }
+  if(projection.clauses && projection.clauses[0] && typeof window.setSpanCursor === 'function') {
+    window.setSpanCursor(projection.clauses[0].index, 'chat');
+  }
 
   if(window._readingPriorityQueue && projection.clauses) {
     const readSet = new Set(allResults.filter(r => r.reclassified || r.confirmed).map(r => r.clauseIndex));
@@ -4483,8 +4891,14 @@ Be direct. 2-4 sentences. Don't hedge if you're confident.`;
         subQuestions: subQuestions.length > 1 ? subQuestions : null,
         provenance: {
           clauseIndices: projection.clauses.map(c => c.index),
+          readClauseIndices: projection.clauses.filter(c => c.isRead).map(c => c.index),
+          walkedClauseIndices: projection.clauses.filter(c => !c.isRead).map(c => c.index),
           entities: projection.entities.map(e => e.name),
           folds: projection.folds.length,
+          foldProvenance: projection.foldProvenance || [],
+          miniReads: (projection.miniReads || []).map(m => m.index),
+          siblings: projection.siblings || [],
+          walking: !!projection.walking,
           section: projection.section?.text,
           docHypothesis: projection.docHypothesis,
           evaScore,
@@ -4862,9 +5276,20 @@ async function exportLog() {
       lines.push(`  A${timeLabel}: ${(ch.answer||'').slice(0, 200)}`);
       if(ch.provenance) {
         const p = ch.provenance;
-        lines.push(`    π clauses: ${(p.clauseIndices||[]).map(i=>'c'+(i+1)).join(', ')}`);
+        const walkedSet = new Set(p.walkedClauseIndices || []);
+        const clauseStr = (p.clauseIndices||[]).map(i => 'c' + (i+1) + (walkedSet.has(i) ? '*' : '')).join(', ');
+        lines.push(`    π clauses: ${clauseStr}`);
         lines.push(`    π entities: ${(p.entities||[]).join(', ') || 'none'}`);
-        lines.push(`    π folds: ${p.folds || 0}`);
+        const fp = p.foldProvenance || [];
+        if(fp.length > 0) {
+          const counts = fp.reduce((m,x) => (m[x.source] = (m[x.source]||0) + 1, m), {});
+          lines.push(`    π folds: ${p.folds || 0} (${Object.entries(counts).map(([k,v])=>k+':'+v).join(', ')})`);
+        } else {
+          lines.push(`    π folds: ${p.folds || 0}`);
+        }
+        if(p.miniReads && p.miniReads.length) lines.push(`    π mini-reads: ${p.miniReads.map(i=>'c'+(i+1)).join(', ')}`);
+        if(p.siblings && p.siblings.length) lines.push(`    π siblings: ${p.siblings.join(', ')}`);
+        if(p.walking) lines.push(`    π posture: walking (* = unread)`);
         if(p.section) lines.push(`    π section: ${p.section.slice(0,80)}`);
         if(p.docHypothesis) lines.push(`    π doc: ${p.docHypothesis.slice(0,80)}`);
       }

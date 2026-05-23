@@ -695,6 +695,45 @@ const STANCES = {
   Composing:'Designing structures that recur, producing systems, architecting patterns, creating frameworks',
 };
 
+// ═══════════════════════════════════════════════════════════
+//  Claim-type registry — what (op, site, stance) a claim/binding HAS by virtue
+//  of its structure. Sites are not embedding-guessed; they are intrinsic to
+//  the type of assertion being made. Each subtype is a distinct connection
+//  kind under one of the 9 operators.
+// ═══════════════════════════════════════════════════════════
+const CLAIM_TYPES = {
+  // X is a person / place / organization — type-membership assertion.
+  // By definition this is a Kind-site claim ("the class not the instance").
+  kind:        { op: 'DEF', site: 'Kind',    stance: 'Composing',  subtype: 'kind'        },
+  // "X is Y" free-text predication on a specific entity.
+  proposition: { op: 'DEF', site: 'Entity',  stance: 'Binding',    subtype: 'proposition' },
+  // "X produces / causes / leads to Y" — systemic relation between named things.
+  causal:      { op: 'CON', site: 'Network', stance: 'Composing',  subtype: 'causal'      },
+  // "not X but Y" — perspective-shift between two framings.
+  contrast:    { op: 'SEG', site: 'Lens',    stance: 'Dissecting', subtype: 'contrast'    },
+  // Quoted speech attributed to a speaker — speaker→quote link.
+  quote:       { op: 'CON', site: 'Link',    stance: 'Tracing',    subtype: 'speech'      },
+  // "named/called X" — entity-name definition.
+  definition:  { op: 'DEF', site: 'Entity',  stance: 'Binding',    subtype: 'name'        },
+};
+
+// Mechanical-binding subtype lookup keyed by binding `source` string.
+// Bindings already carry op/site/stance, but this surfaces WHICH connection it is.
+const BINDING_SUBTYPES = {
+  'mech:name-reveal':      'name',
+  'mech:coref-name':       'coref',
+  'mech:age':              'age',
+  'mech:measurement':      'measurement',
+  'mech:appos-role':       'role',
+  'mech:speech':           'speech',
+  'mech:origin':           'origin',
+  'mech:kind-mechanism':   'mechanism',
+  'mech:verb:cares_for':   'verb-care',
+  'mech:verb:treated_for': 'verb-treatment',
+  'mech:verb:rescued_by':  'verb-rescue',
+  'mech:verb:arrested_by': 'verb-arrest',
+};
+
 const OP_COLORS = {
   NUL:'#6b7280',SIG:'#8b5cf6',INS:'#22c55e',SEG:'#f97316',
   CON:'#a78bfa',SYN:'#06b6d4',DEF:'#3b82f6',EVA:'#eab308',REC:'#ef4444',
@@ -1130,15 +1169,21 @@ function resolveDefiniteNP(head, headStack, knownEntities) {
 function pushBinding(out, b) {
   if(!b.subject || !b.object) return;
   if(String(b.subject).toLowerCase() === String(b.object).toLowerCase()) return;
+  const source = b.source || 'mechanical';
+  // subtype: which specific connection-kind under this operator (name, role,
+  // speech, coref, origin, age, etc.). Lifted from `source` via BINDING_SUBTYPES
+  // so consumers don't have to parse the mech: prefix.
+  const subtype = b.subtype || BINDING_SUBTYPES[source] || null;
   out.push({
     op: b.op, site: b.site, stance: b.stance,
+    subtype,
     subject: String(b.subject).trim(),
     subjectDisplay: b.subjectDisplay || b.subject,
     predicate: b.predicate || null,
     object: String(b.object).trim(),
     span: (b.span || '').slice(0, 160),
     clauseIndex: b.clauseIndex,
-    source: b.source || 'mechanical',
+    source,
     confidence: b.confidence ?? 0.7,
   });
 }
@@ -1894,14 +1939,29 @@ async function processText(text) {
       continue;
     }
 
-    // Classify claims
+    // Classify claims. A claim's site is determined by what KIND of claim it is,
+    // not by embedding-distance on its raw span text. The CLAIM_TYPES registry
+    // is the single source of truth — kind→Kind, quote→Link, causal→Network, etc.
     const classifiedClaims = [];
     for(const claim of extraction.claims){
-      const sv = await embed(claim.span);
-      const cl = {
-        ...claim, clauseIndex:i, salience:sal,
-        ...classifyAxes(sv),
-      };
+      const typeEntry = CLAIM_TYPES[claim.rawType];
+      let cl;
+      if(typeEntry) {
+        cl = {
+          ...claim, clauseIndex:i, salience:sal,
+          operator: { name: typeEntry.op,    score: 1, runnerUp: null, margin: 1, mechanical: true },
+          terrain:  { name: typeEntry.site,  score: 1, runnerUp: null, margin: 1, mechanical: true },
+          stance:   { name: typeEntry.stance,score: 1, runnerUp: null, margin: 1, mechanical: true },
+          subtype: typeEntry.subtype,
+          mechanical: true,
+        };
+      } else {
+        const sv = await embed(claim.span);
+        cl = {
+          ...claim, clauseIndex:i, salience:sal,
+          ...classifyAxes(sv),
+        };
+      }
       classifiedClaims.push(cl);
 
       // Track propositions for LLM reading
@@ -1912,18 +1972,26 @@ async function processText(text) {
         });
       }
 
-      // Build graph
+      // Build graph. ent.terrain comes from the kind-claim if any (so a person
+      // always reads as Entity-ish for display), not from the first random claim.
       const key = claim.entity.toLowerCase();
       if(key&&key!=='?'&&!key.startsWith('(')){
         if(!graph.entities[key]) {
-          graph.entities[key]={name:claim.entity,terrain:cl.terrain.name,claims:[],edges:[],mentions:[],ledgers:{},stage:'extracted'};
+          const homeSite = claim.rawType === 'kind' ? 'Entity' : cl.terrain.name;
+          graph.entities[key]={name:claim.entity,terrain:homeSite,claims:[],edges:[],mentions:[],ledgers:{},stage:'extracted'};
           emit('INS', cl.terrain.name, cl.stance.name, claim.entity, claim.rawType, i);
+        } else if(claim.rawType === 'kind' && graph.entities[key].terrain !== 'Entity') {
+          // Upgrade ent.terrain to Entity once we see a kind-claim, regardless of
+          // whatever random site the first non-kind claim landed in.
+          graph.entities[key].terrain = 'Entity';
         }
         graph.entities[key].claims.push({
           entity:claim.entity,value:claim.value,span:claim.span,rawType:claim.rawType,
           operator:cl.operator.name,site:cl.terrain.name,resolution:cl.stance.name,
           notation:`${cl.operator.name}(${cl.terrain.name},${cl.stance.name})`,clauseIndex:i,fn:null,
           speaker: claim.speaker,
+          subtype: cl.subtype,
+          mechanical: cl.mechanical === true,
         });
         graph.entities[key].mentions.push(i);
         graph.claims.push(graph.entities[key].claims[graph.entities[key].claims.length-1]);
@@ -2298,6 +2366,15 @@ function rebuildLedgers(){
     for(const [key, ent] of Object.entries(graph.entities)) {
       for(const claim of ent.claims) {
         if(claim.clauseIndex === r.clauseIndex) {
+          // Mechanically-typed claims (kind, quote, causal, contrast, etc.)
+          // own their op/site/stance by definition; the LLM clause-reading
+          // is about the clause as a whole, not about individual claims.
+          // Only carry over the human-readable fn and speaker for those.
+          if(claim.mechanical) {
+            if(r.speaker) claim.speaker = r.speaker;
+            if(r.fn) claim.fn = r.fn;
+            continue;
+          }
           claim.operator = correctedOp;
           claim.site = correctedSite;
           claim.resolution = correctedStance;
@@ -2482,15 +2559,68 @@ async function startReading(){
     ['Cultivating','Making','Composing'],
   ];
 
-  const system=`Reply with ONLY a JSON object. No other text.
-{"q1":N,"q2":N,"q3":N,"fn":"what it does","sp":null,"sd":0,"eq":null}
-q1: 1=separating 2=connecting 3=producing
-q2: 1=existence 2=organization 3=meaning
-q3: 1=background 2=particular 3=pattern
+  // Each face is generated by 2 questions × 3 options. Three dedicated prompts so the
+  // small model only learns one face at a time. Definitions of the 9 cells per face
+  // are included so it can ground each pick.
+  const SYS_OP = `Classify what this sentence DOES. Reply with JSON only, no other text.
+{"mode":N,"domain":N,"fn":"...","eq":null}
+
+mode — what is the sentence doing?
+  1 = Separating: dividing, negating, distinguishing, restricting, excluding
+  2 = Connecting: linking, bridging, relating, also, with, in addition
+  3 = Producing: creating, founding, introducing, generating, building
+
+domain — what does it operate on?
+  1 = Existence: whether something is/isn't, presence, absence, appearing
+  2 = Organization: how things relate, structure, connections, networks
+  3 = Meaning: what something signifies, judgment, framing, interpretation
+
+The pair yields one operator:
+  Sep+Exi=NUL (noting absence)   Sep+Org=SEG (boundary)      Sep+Mea=DEF (stating a fact)
+  Con+Exi=SIG (pointing to)      Con+Org=CON (linking two)   Con+Mea=EVA (judging)
+  Pro+Exi=INS (introducing new)  Pro+Org=SYN (synthesizing)  Pro+Mea=REC (replacing frame)
+
 fn: 3-8 words describing what THIS sentence does
-sp: who is speaking (name or null if narrator)
-sd: 0=narrator 1=quoted speech 2=quote-within-quote
-eq: if a name in this sentence refers to a [known] entity, write "short=full" (e.g. "Walz=Tim Walz"). null otherwise.`;
+eq: if a short name refers to a known entity write "short=full"; null otherwise`;
+
+  const SYS_SITE = `Classify what this sentence is ABOUT. Reply with JSON only, no other text.
+{"domain":N,"object":N}
+
+domain — what is at issue?
+  1 = Existence: presence/absence, ambient conditions
+  2 = Organization: relations, structure, ties between things
+  3 = Meaning: interpretation, framing, judgment
+
+object — at what scale?
+  1 = Background: ambient field, environment, context (no specific thing in focus)
+  2 = Particular: one specific named thing (this person, this place, this event)
+  3 = Pattern: a recurring type, category, rule, or schema
+
+The pair yields one site:
+  Exi+Bg=Void (atmospheric absence)   Exi+Par=Entity (specific thing)  Exi+Pat=Kind (type/category)
+  Org+Bg=Field (relational env)       Org+Par=Link (a specific bond)   Org+Pat=Network (system)
+  Mea+Bg=Atmosphere (cultural mood)   Mea+Par=Lens (one viewpoint)     Mea+Pat=Paradigm (worldview)`;
+
+  const SYS_STANCE = `Classify HOW this sentence acts. Reply with JSON only, no other text.
+{"mode":N,"object":N,"sp":null,"sd":0}
+
+mode — what is it doing?
+  1 = Separating: dividing, negating, distinguishing
+  2 = Connecting: linking, relating, bridging
+  3 = Producing: creating, generating, building
+
+object — at what scale?
+  1 = Background: ambient, environmental, no focused thing
+  2 = Particular: this specific thing
+  3 = Pattern: a recurring type or rule
+
+The pair yields one stance:
+  Sep+Bg=Clearing       Sep+Par=Dissecting    Sep+Pat=Unraveling
+  Con+Bg=Tending        Con+Par=Binding       Con+Pat=Tracing
+  Pro+Bg=Cultivating    Pro+Par=Making        Pro+Pat=Composing
+
+sp: who is speaking (name) or null if narrator
+sd: 0=narrator 1=quoted speech 2=quote-within-quote`;
 
   const allReadings = [];
   let corrections = 0, confirmations = 0, skipped = 0, errors = [];
@@ -2630,85 +2760,87 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
         setStatus(`Resuming c${r.clauseIndex+1}…`);
       }
 
-      const reply = await llmEngine.chat.completions.create({
-        messages:[{role:'system',content:system},{role:'user',content:user}],
-        max_tokens: 80, temperature: 0.1,
-      });
-      const raw = (reply.choices[0]?.message?.content || '').trim();
+      // One LLM call per face. Each call sees only the 2 axes it needs.
+      const callFace = async (sys, maxTokens) => {
+        const reply = await llmEngine.chat.completions.create({
+          messages:[{role:'system',content:sys},{role:'user',content:user}],
+          max_tokens: maxTokens, temperature: 0.1,
+        });
+        const txt = (reply.choices[0]?.message?.content || '').trim();
+        let parsed = null;
+        try {
+          const cleaned = txt.replace(/```json\s*/g,'').replace(/```/g,'').trim();
+          const m = cleaned.match(/\{[\s\S]*?\}/);
+          if(m) parsed = JSON.parse(m[0]);
+        } catch(e) {}
+        // Digit fallback when JSON fails: grab the first two 1-3 digits.
+        if(!parsed) {
+          const digits = txt.match(/[1-3]/g);
+          if(digits && digits.length >= 2) parsed = { a: +digits[0], b: +digits[1], raw: txt };
+        }
+        return { raw: txt, parsed };
+      };
+
+      const [opRes, siteRes, stanceRes] = await Promise.all([
+        callFace(SYS_OP, 80),
+        callFace(SYS_SITE, 40),
+        callFace(SYS_STANCE, 50),
+      ]);
+      const raw = `[op]${opRes.raw} [site]${siteRes.raw} [stance]${stanceRes.raw}`;
 
       let parsedOp = null, parsedSite = null, parsedStance = null, fn = null;
       let parsedMode = null, parsedDomain = null, parsedObject = null;
       let parsedSpeaker = null, parsedSpeakerDepth = 0;
       let parsedSame = null, parsedLink = null;
 
-      try {
-        let jsonStr = raw.replace(/```json\s*/g,'').replace(/```/g,'').trim();
-        const jsonMatch = jsonStr.match(/\{[^}]+\}/);
-        if(jsonMatch) {
-          const j = JSON.parse(jsonMatch[0]);
-          const q1 = (parseInt(j.q1||j.Q1||j['1']) || 1) - 1;
-          const q2 = (parseInt(j.q2||j.Q2||j['2']) || 1) - 1;
-          const q3 = (parseInt(j.q3||j.Q3||j['3']) || 1) - 1;
-          if(q1 >= 0 && q1 < 3 && q2 >= 0 && q2 < 3 && q3 >= 0 && q3 < 3) {
-            const MK = Object.keys(MODES);
-            const DK = Object.keys(DOMAINS);
-            const OK = Object.keys(OBJECTS);
-            parsedMode = MK[q1]; parsedDomain = DK[q2]; parsedObject = OK[q3];
-            parsedOp = OP_GRID[q1]?.[q2] || null;
-            parsedSite = SITE_GRID[q2]?.[q3] || null;
-            parsedStance = STANCE_GRID[q1]?.[q3] || null;
-            fn = j.fn ? stripPreamble(String(j.fn)).slice(0, 60) : null;
-            if(j.sp) parsedSpeaker = String(j.sp).slice(0, 40);
-            if(j.sd) parsedSpeakerDepth = parseInt(j.sd) || 0;
-            if(j.eq && typeof j.eq === 'string' && j.eq.includes('=') && j.eq !== 'short=full' && j.eq !== 'null') {
-              parsedSame = j.eq;
-            }
-          }
+      const MK = Object.keys(MODES), DK = Object.keys(DOMAINS), OK = Object.keys(OBJECTS);
+      const pick = (j, ...keys) => {
+        for(const k of keys) {
+          const v = j?.[k];
+          if(v != null) { const n = parseInt(v); if(n >= 1 && n <= 3) return n - 1; }
         }
-      } catch(e) {}
+        return -1;
+      };
 
-      if(!parsedOp) {
-        const numMatch = raw.match(/([1-3])\s*[,.\s]\s*([1-3])\s*[,.\s]\s*([1-3])\s*\|(.+)/);
-        if(numMatch) {
-          const q1 = parseInt(numMatch[1]) - 1;
-          const q2 = parseInt(numMatch[2]) - 1;
-          const q3 = parseInt(numMatch[3]) - 1;
-          const MK = Object.keys(MODES); const DK = Object.keys(DOMAINS); const OK = Object.keys(OBJECTS);
-          parsedMode = MK[q1]; parsedDomain = DK[q2]; parsedObject = OK[q3];
-          parsedOp = OP_GRID[q1]?.[q2] || null;
-          parsedSite = SITE_GRID[q2]?.[q3] || null;
-          parsedStance = STANCE_GRID[q1]?.[q3] || null;
-          fn = numMatch[4].trim().slice(0, 60);
+      // Operator face: mode × domain
+      if(opRes.parsed) {
+        const j = opRes.parsed;
+        const m = pick(j, 'mode', 'q1', 'a');
+        const d = pick(j, 'domain', 'q2', 'b');
+        if(m >= 0 && d >= 0) {
+          parsedOp = OP_GRID[m]?.[d] || null;
+          parsedMode = MK[m]; parsedDomain = DK[d];
+        }
+        if(j.fn) fn = stripPreamble(String(j.fn)).slice(0, 60);
+        if(j.eq && typeof j.eq === 'string' && j.eq.includes('=') && j.eq !== 'short=full' && j.eq !== 'null') {
+          parsedSame = j.eq;
         }
       }
 
-      if(!parsedOp) {
-        const lower = raw.toLowerCase();
-        const modeWords = {separating:0,connecting:1,producing:2,separate:0,connect:1,produce:2};
-        const domainWords = {existence:0,organization:1,meaning:2,exist:0,organ:1,mean:2};
-        const objectWords = {background:0,particular:1,pattern:2,backgr:0,partic:1,patt:2};
-        let q1=-1, q2=-1, q3=-1;
-        for(const[w,idx] of Object.entries(modeWords)){if(lower.includes(w)){q1=idx;break;}}
-        for(const[w,idx] of Object.entries(domainWords)){if(lower.includes(w)){q2=idx;break;}}
-        for(const[w,idx] of Object.entries(objectWords)){if(lower.includes(w)){q3=idx;break;}}
-        if(q1>=0 && q2>=0) {
-          parsedOp = OP_GRID[q1]?.[q2] || null;
-          if(q3>=0) { parsedSite = SITE_GRID[q2]?.[q3] || null; parsedStance = STANCE_GRID[q1]?.[q3] || null; }
+      // Site face: domain × object
+      if(siteRes.parsed) {
+        const j = siteRes.parsed;
+        const d = pick(j, 'domain', 'q1', 'a');
+        const o = pick(j, 'object', 'q2', 'b');
+        if(d >= 0 && o >= 0) {
+          parsedSite = SITE_GRID[d]?.[o] || null;
+          if(!parsedDomain) parsedDomain = DK[d];
+          parsedObject = OK[o];
         }
       }
 
-      if(!parsedOp) {
-        const digits = raw.match(/[1-3]/g);
-        if(digits && digits.length >= 2) {
-          const q1 = parseInt(digits[0]) - 1;
-          const q2 = parseInt(digits[1]) - 1;
-          const q3 = digits.length >= 3 ? parseInt(digits[2]) - 1 : 1;
-          if(q1>=0&&q1<3&&q2>=0&&q2<3) {
-            parsedOp = OP_GRID[q1]?.[q2] || null;
-            parsedSite = SITE_GRID[q2]?.[q3] || null;
-            parsedStance = STANCE_GRID[q1]?.[q3] || null;
-          }
+      // Stance face: mode × object
+      if(stanceRes.parsed) {
+        const j = stanceRes.parsed;
+        const m = pick(j, 'mode', 'q1', 'a');
+        const o = pick(j, 'object', 'q2', 'b');
+        if(m >= 0 && o >= 0) {
+          parsedStance = STANCE_GRID[m]?.[o] || null;
+          if(!parsedMode) parsedMode = MK[m];
+          if(!parsedObject) parsedObject = OK[o];
         }
+        if(j.sp) parsedSpeaker = String(j.sp).slice(0, 40);
+        if(j.sd) parsedSpeakerDepth = parseInt(j.sd) || 0;
       }
 
       if(fn) fn = fn.replace(/>>>/g,'').replace(/<<</g,'').replace(/\[describe the sentence\]/gi,'').replace(/^This specific sentence /i,'').trim().slice(0,60);

@@ -2635,17 +2635,18 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
       .sort(([,a], [,b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
       .slice(0, 6);
     if(knownInClause.length > 0) {
-      // Show the model each known entity's CURRENT hypothesis when it
-      // has one. Lets the per-clause read build on (or contradict) the
-      // accumulated reading of that entity, rather than starting from
-      // scratch every sentence.
+      // Show the model each known site's CURRENT working hypothesis when
+      // it has one. The per-clause read can build on, refine, or
+      // contradict the accumulated reading of that site, rather than
+      // starting from scratch every sentence. These are HYPOTHESES — the
+      // model can override them with what the current clause supports.
       const hints = knownInClause.map(([key, ent]) => {
         const kind = (ent.claims||[]).find(c => c.rawType === 'kind');
         const tag = resolveEntity(key) + (kind ? ` (${kind.value})` : '');
-        if(ent.hypothesis) return `${tag} — so far: "${ent.hypothesis.slice(0, 100)}"`;
+        if(ent.hypothesis) return `${tag} — working hypothesis: "${ent.hypothesis.slice(0, 110)}"`;
         return tag;
       });
-      user += `[known:\n  ${hints.join('\n  ')}]\n`;
+      user += `[known sites (working hypotheses — overridable by this clause):\n  ${hints.join('\n  ')}]\n`;
     }
 
     if(r.quoteState) {
@@ -3108,11 +3109,13 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
       };
 
       // ── Hypotheses evolve ─────────────────────────────────────
-      // After every batch of new facts about an entity, ask the model
-      // to write a one-sentence hypothesis for who/what that entity is,
-      // shown its prior hypothesis. The model is allowed to keep,
-      // refine, or contradict the prior reading — the only rule is to
-      // build on what has come before, not restart from scratch.
+      // The graph is a working hypothesis. Every entity ("site") has a
+      // one-sentence hypothesis for who/what it is. At intervals — keyed
+      // to how many times the site has been read — we revise that
+      // hypothesis, feeding the model BOTH the prior hypothesis AND a
+      // chunk of primary source content (the actual clauses the site
+      // appeared in). The model is allowed to keep, refine, or overturn
+      // the prior reading. The trail of revisions is preserved.
       // (See HYPOTHESIS_ENTITY in the original eoReader prompts.js.)
       const touchedEntityKeys = new Set();
       for(const claim of newClaimsAdded) {
@@ -3124,30 +3127,83 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
         if(!ent) continue;
         ent._llmFactCount = (ent._llmFactCount || 0) + 1;
         // Revise on 1st, 3rd, 6th, 10th… llm-read fact. Cheap early,
-        // sparse later, so entities with many mentions still get
+        // sparse later, so sites with many mentions still get
         // periodic re-evaluation without flooding the LLM.
         const triggers = new Set([1, 3, 6, 10, 16, 24, 36]);
         if(!triggers.has(ent._llmFactCount)) continue;
         try {
+          // PRIMARY SOURCE: the actual clauses where this site appeared.
+          // Distilled facts compress reading; primary text lets the model
+          // SEE what the source actually says before revising. Cap to
+          // keep the prompt inside what tiny models can handle.
+          const seen = new Set();
+          const sourceSpans = [];
+          let charBudget = 1400;
+          const clauseRecs = (ent.mentions || [])
+            .map(idx => allResults.find(ar => ar.clauseIndex === idx))
+            .filter(Boolean);
+          // Most recent + earliest mention first — gives the model both
+          // how the site was introduced and how it is currently being used.
+          const ordered = [
+            ...clauseRecs.slice(-5).reverse(),
+            ...clauseRecs.slice(0, 2),
+          ];
+          for(const cr of ordered) {
+            if(seen.has(cr.clauseIndex)) continue;
+            const txt = (cr.clause || '').trim().slice(0, 280);
+            if(!txt) continue;
+            if(txt.length > charBudget) break;
+            sourceSpans.push(`  [c${cr.clauseIndex + 1}] "${txt}"`);
+            seen.add(cr.clauseIndex);
+            charBudget -= txt.length + 10;
+          }
+          const sourceBlock = sourceSpans.join('\n');
+
           const llmFacts = (ent.claims || [])
             .filter(c => c.rawType === 'def-llm' || c.rawType === 'eva-llm')
-            .slice(-8);
+            .slice(-6);
           const factLines = llmFacts.map(c =>
-            (c.rawType === 'eva-llm' ? '⚖ ' : '· ') + c.value
+            (c.rawType === 'eva-llm' ? '  ⚖ ' : '  · ') + c.value
           ).join('\n');
+
           const priorHyp = ent.hypothesis;
+          const revCount = (ent.priorHypotheses || []).length;
+          const epistemic = `This is a WORKING HYPOTHESIS — a provisional reading. Later evidence may overturn it. Build on the prior reading; do not restart from scratch.`;
           const entPrompt = priorHyp
-            ? `Prior reading of "${ent.name}":\n"${priorHyp}"\n\nAll facts the text has reported about ${ent.name} so far:\n${factLines}\n\nRevise into ONE sentence (under 25 words) for who or what ${ent.name} is in this text. Build on the prior reading. Keep what still holds. Drop what was contradicted. Be specific — say what ${ent.name} actually does or is, not "${ent.name} is mentioned".`
-            : `Entity: ${ent.name}\nFacts the text reports about ${ent.name}:\n${factLines}\n\nWrite ONE sentence (under 25 words) for who or what ${ent.name} is in this text. Be specific.`;
+            ? `${epistemic}
+
+SITE: ${ent.name}
+PRIOR WORKING HYPOTHESIS (rev ${revCount}):
+"${priorHyp}"
+
+PRIMARY SOURCE — clauses in which ${ent.name} appears (verbatim):
+${sourceBlock}
+
+DISTILLED READINGS so far:
+${factLines || '  (none)'}
+
+Revise into ONE specific sentence (under 30 words) describing who or what ${ent.name} is in this text. Keep what the source supports. Drop what later clauses overturned. Be specific — name a role, an action, an attribute — not "${ent.name} is mentioned". If the source is too thin to support a claim, say so honestly.`
+            : `${epistemic}
+
+SITE: ${ent.name}
+(no prior hypothesis — first reading)
+
+PRIMARY SOURCE — clauses in which ${ent.name} appears (verbatim):
+${sourceBlock}
+
+DISTILLED READINGS:
+${factLines || '  (none)'}
+
+Write ONE specific sentence (under 30 words) for who or what ${ent.name} is in this text. Stay close to what the source actually says.`;
           const hypReply = await llmEngine.chat.completions.create({
             messages: [
-              { role: 'system', content: 'You write one specific sentence. No preamble, no quotes around the sentence.' },
+              { role: 'system', content: 'You are building a working hypothesis about who or what a named site in a text is. Reply with ONE specific sentence and nothing else — no preamble, no quotes around it, no labels.' },
               { role: 'user', content: entPrompt },
             ],
-            max_tokens: 70, temperature: 0.15,
+            max_tokens: 90, temperature: 0.2,
           });
           const newHyp = stripPreamble((hypReply.choices[0]?.message?.content || '').trim());
-          if(newHyp && newHyp.length > 8 && newHyp.length < 300) {
+          if(newHyp && newHyp.length > 8 && newHyp.length < 400) {
             ent.priorHypotheses = ent.priorHypotheses || [];
             if(priorHyp && priorHyp !== newHyp) {
               ent.priorHypotheses.push({
@@ -3158,17 +3214,19 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
               });
             }
             ent.hypothesis = newHyp;
+            ent.hypothesisRev = (ent.hypothesisRev || 0) + 1;
+            ent.hypothesisStatus = 'working';
             emit('SYN', 'Entity', 'Composing', ent.name,
               newHyp.slice(0, 80), r.clauseIndex);
           }
         } catch(_) { /* keep prior hypothesis on revision failure */ }
       }
 
-      // Every ~20 clauses, re-evaluate the doc hypothesis using the
-      // best entity hypotheses we've accumulated. The model can — and
-      // should — overturn the early doc-id guess if later evidence
-      // points elsewhere. This is the "doesn't have to be right always,
-      // just eventually" loop.
+      // Every ~20 clauses, re-evaluate the doc working hypothesis using
+      // the best site hypotheses we've accumulated, plus a few of the
+      // highest-salience source clauses as primary text. The model can
+      // — and should — overturn the early doc-id guess if later
+      // evidence points elsewhere.
       if(i > 0 && i % 20 === 0) {
         try {
           const ranked = Object.entries(graph.entities)
@@ -3178,20 +3236,54 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
             .slice(0, 8);
           if(ranked.length >= 2) {
             const entLines = ranked.map(([, e]) =>
-              `- ${e.name}: ${e.hypothesis}`).join('\n');
+              `  • ${e.name}: ${e.hypothesis}`).join('\n');
+            // Primary-source sample for the doc hypothesis — high-salience
+            // clauses we've read so far, capped so the prompt stays small.
+            const readSoFar = allReadings.map(ar => ar.clauseIndex);
+            const readSet = new Set(readSoFar);
+            const docSourcePicks = [...allResults]
+              .filter(ar => readSet.has(ar.clauseIndex) && (ar.salience || 0) > 0.25)
+              .sort((a, b) => (b.salience || 0) - (a.salience || 0))
+              .slice(0, 5);
+            const docSourceBlock = docSourcePicks
+              .sort((a, b) => a.clauseIndex - b.clauseIndex)
+              .map(ar => `  [c${ar.clauseIndex + 1}] "${(ar.clause || '').trim().slice(0, 220)}"`)
+              .join('\n');
+
             const prior = docHyp || graph.hypotheses?.doc || '';
+            const priorRevs = (graph.hypotheses?.priorDocs || []).length;
+            const epistemic = `This is a WORKING HYPOTHESIS about the document — provisional, may be overturned by later reading.`;
             const docRevPrompt = prior
-              ? `Prior reading of this text:\n"${prior}"\n\nWhat we have learned about its main subjects:\n${entLines}\n\nRevise into ONE sentence (under 30 words) for what this text is about and what kind of text it is. Build on the prior reading. Keep what still holds. Overturn what later evidence contradicts. Do not invent an author — only name the author if our entity readings make it clear who wrote it.`
-              : `Main subjects of the text:\n${entLines}\n\nWrite ONE sentence (under 30 words) for what this text is about and what kind of text it is. Do not invent an author.`;
+              ? `${epistemic}
+
+PRIOR WORKING HYPOTHESIS (rev ${priorRevs}):
+"${prior}"
+
+WORKING HYPOTHESES about the main sites in this text:
+${entLines}
+
+PRIMARY SOURCE — high-salience clauses read so far (verbatim):
+${docSourceBlock || '  (none above threshold)'}
+
+Revise into ONE sentence (under 35 words) for what this document is and what it is about. Build on the prior reading. Overturn it if the sites and source contradict it. Do not invent an author — only state authorship if a site hypothesis directly supports it.`
+              : `${epistemic}
+
+WORKING HYPOTHESES about the main sites in this text:
+${entLines}
+
+PRIMARY SOURCE — high-salience clauses read so far (verbatim):
+${docSourceBlock || '  (none above threshold)'}
+
+Write ONE sentence (under 35 words) for what this document is and what it is about. Do not invent an author.`;
             const revReply = await llmEngine.chat.completions.create({
               messages: [
-                { role: 'system', content: 'You write one specific sentence. No preamble, no quotes.' },
+                { role: 'system', content: 'You are building a working hypothesis about a document. Reply with ONE specific sentence and nothing else — no preamble, no quotes.' },
                 { role: 'user', content: docRevPrompt },
               ],
-              max_tokens: 90, temperature: 0.15,
+              max_tokens: 110, temperature: 0.2,
             });
             const revised = stripPreamble((revReply.choices[0]?.message?.content || '').trim());
-            if(revised && revised.length > 15 && revised.length < 400) {
+            if(revised && revised.length > 15 && revised.length < 500) {
               graph.hypotheses = graph.hypotheses || {};
               graph.hypotheses.priorDocs = graph.hypotheses.priorDocs || [];
               if(prior && prior !== revised) {
@@ -3203,6 +3295,8 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
               }
               docHyp = revised;
               graph.hypotheses.doc = revised;
+              graph.hypotheses.docRev = (graph.hypotheses.docRev || 0) + 1;
+              graph.hypotheses.docStatus = 'working';
               emit('SYN', 'Kind', 'Composing', 'doc-revision',
                 revised.slice(0, 100), r.clauseIndex);
             }
@@ -3797,32 +3891,36 @@ function renderReadings(){
 
   const hyps = graph.hypotheses || {};
   if(hyps.doc) {
-    html+=`<div class="hyp-box hyp-doc"><span class="hyp-label">DOC</span> ${esc(hyps.doc)}</div>`;
+    const docRev = hyps.docRev || 0;
+    const revTag = docRev > 0 ? ` <span style="opacity:0.5;font-size:10px;font-weight:normal">rev ${docRev}</span>` : '';
+    html+=`<div class="hyp-box hyp-doc"><span class="hyp-label">WORKING HYP · DOC</span>${revTag} ${esc(hyps.doc)}</div>`;
     // Show the trail of revisions so you can SEE the reading evolve.
     const priors = hyps.priorDocs || [];
     if(priors.length > 0) {
-      html+=`<details style="margin:4px 0 8px 12px;font-size:11px;color:var(--dim)"><summary style="cursor:pointer;opacity:0.7">${priors.length} prior reading${priors.length===1?'':'s'}</summary>`;
+      html+=`<details style="margin:4px 0 8px 12px;font-size:11px;color:var(--dim)"><summary style="cursor:pointer;opacity:0.7">${priors.length} prior reading${priors.length===1?'':'s'} — overturned</summary>`;
       for(const p of priors) {
         html+=`<div style="padding:2px 0;opacity:0.6"><span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s></div>`;
       }
       html+=`</details>`;
     }
   }
-  // Entity hypotheses — the model's evolving reading of who each named
-  // thing is. Sorted by mention count, capped so the panel stays usable.
+  // Site hypotheses — the model's evolving working hypothesis for who
+  // each named site is. The graph IS these hypotheses, not facts.
   const entHyps = Object.entries(graph.entities || {})
     .filter(([, e]) => e.hypothesis)
     .sort(([, a], [, b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
     .slice(0, 10);
   if(entHyps.length > 0) {
-    html+=`<div class="section-label" style="margin-top:8px;opacity:0.7">entities · what we think they are</div>`;
+    html+=`<div class="section-label" style="margin-top:8px;opacity:0.7">sites · working hypotheses (revisable)</div>`;
     for(const [, e] of entHyps) {
       const priors = e.priorHypotheses || [];
+      const rev = e.hypothesisRev || 0;
       html+=`<div class="hyp-box" style="background:rgba(92,224,160,0.04);border-left:3px solid var(--green);font-size:12px">`;
-      html+=`<span class="hyp-label" style="color:var(--green)">${esc(e.name)}</span> ${esc(e.hypothesis)}`;
+      html+=`<span class="hyp-label" style="color:var(--green)">${esc(e.name)}</span>`;
+      if(rev > 0) html+=` <span style="opacity:0.45;font-size:10px">rev ${rev}</span>`;
+      html+=` ${esc(e.hypothesis)}`;
       if(priors.length > 0) {
-        html+=` <span style="opacity:0.5;font-size:10px">· revised ${priors.length}×</span>`;
-        html+=`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:10px;opacity:0.5">trail</summary>`;
+        html+=`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:10px;opacity:0.5">${priors.length} overturned</summary>`;
         for(const p of priors) {
           html+=`<div style="padding:1px 0;font-size:10px;opacity:0.55"><span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s></div>`;
         }

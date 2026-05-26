@@ -2583,6 +2583,27 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
     }
   }
 
+  // Tolerant JSON extractor — small models nest objects and arrays,
+  // so a single {[^}]+} regex isn't enough. Walks braces (ignoring
+  // string contents) to find the first balanced JSON object. Hoisted
+  // here so the per-clause read AND the hypothesis revision blocks
+  // below can share it.
+  function extractBalancedJson(s) {
+    const start = s.indexOf('{');
+    if(start < 0) return null;
+    let depth = 0, inStr = false, esc = false;
+    for(let p = start; p < s.length; p++) {
+      const ch = s[p];
+      if(esc) { esc = false; continue; }
+      if(ch === '\\') { esc = true; continue; }
+      if(ch === '"') { inStr = !inStr; continue; }
+      if(inStr) continue;
+      if(ch === '{') depth++;
+      else if(ch === '}') { depth--; if(depth === 0) return s.slice(start, p + 1); }
+    }
+    return null;
+  }
+
   for(let i = 0; i < toRead.length; i++){
     if(readingPriorityQueue.length > 0) {
       const pIdx = readingPriorityQueue.shift();
@@ -2739,25 +2760,6 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
       let parsedFacts = [];        // [{e, says}]   — DEF events
       let parsedRelations = [];    // [{from, to, how}] — CON events
       let parsedJudgments = [];    // [{about, claim, holds}] — EVA events
-
-      // Tolerant JSON extractor — small models often produce nested
-      // objects and arrays, so a single {[^}]+} regex isn't enough.
-      // Walk braces to find the first balanced JSON object.
-      function extractBalancedJson(s) {
-        const start = s.indexOf('{');
-        if(start < 0) return null;
-        let depth = 0, inStr = false, esc = false;
-        for(let p = start; p < s.length; p++) {
-          const ch = s[p];
-          if(esc) { esc = false; continue; }
-          if(ch === '\\') { esc = true; continue; }
-          if(ch === '"') { inStr = !inStr; continue; }
-          if(inStr) continue;
-          if(ch === '{') depth++;
-          else if(ch === '}') { depth--; if(depth === 0) return s.slice(start, p + 1); }
-        }
-        return null;
-      }
 
       try {
         const cleaned = raw.replace(/```json\s*/g,'').replace(/```/g,'').trim();
@@ -3066,6 +3068,14 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
             name: name, terrain: terrain || 'Entity',
             claims: [], edges: [], mentions: [], ledgers: {},
             stage: 'read', viaLLM: true,
+            eoLog: [{
+              op: 'INS', site: terrain || 'Entity', stance: 'Clearing',
+              ts: new Date().toISOString(),
+              clauseIndex: r.clauseIndex,
+              value: 'site introduced from llm-read',
+              span: r.clause.slice(0, 200),
+              provenance: 'llm-read',
+            }],
           };
           emit('INS', terrain || 'Entity', 'Clearing', name, 'llm-read', r.clauseIndex);
         }
@@ -3097,6 +3107,14 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
         ent.mentions.push(r.clauseIndex);
         graph.claims.push(claim);
         newClaimsAdded.push(claim);
+        ent.eoLog = ent.eoLog || [];
+        ent.eoLog.push({
+          op: 'DEF', site: 'Entity', stance: 'Clearing',
+          ts: new Date().toISOString(),
+          clauseIndex: r.clauseIndex,
+          value: f.says, span: r.clause.slice(0, 200),
+          provenance: 'llm-read',
+        });
         emit('DEF', 'Entity', 'Clearing', ent.name, f.says.slice(0, 80), r.clauseIndex);
       }
 
@@ -3128,6 +3146,19 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
           b.object === binding.object && b.clauseIndex === binding.clauseIndex
         );
         if(!dupeBind) graph.bindings.push(binding);
+        const conEntry = {
+          op: 'CON', site: 'Network', stance: 'Binding',
+          ts: new Date().toISOString(),
+          clauseIndex: r.clauseIndex,
+          value: `${rel.how}→${toEnt.name}`,
+          relation: rel.how, to: toEnt.name,
+          span: r.clause.slice(0, 200),
+          provenance: 'llm-read',
+        };
+        fromEnt.eoLog = fromEnt.eoLog || [];
+        fromEnt.eoLog.push(conEntry);
+        toEnt.eoLog = toEnt.eoLog || [];
+        toEnt.eoLog.push({ ...conEntry, value: `←${rel.how} ${fromEnt.name}`, from: fromEnt.name });
         emit('CON', 'Network', 'Binding', fromEnt.name, `${rel.how}→${toEnt.name}`, r.clauseIndex);
       }
 
@@ -3149,6 +3180,16 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
         ent.claims.push(claim);
         ent.mentions.push(r.clauseIndex);
         graph.claims.push(claim);
+        ent.eoLog = ent.eoLog || [];
+        ent.eoLog.push({
+          op: 'EVA', site: 'Lens', stance: 'Tracing',
+          ts: new Date().toISOString(),
+          clauseIndex: r.clauseIndex,
+          value: jdg.claim,
+          status: jdg.holds ? 'holds' : 'fails',
+          span: r.clause.slice(0, 200),
+          provenance: 'llm-read',
+        });
         emit('EVA', 'Lens', 'Tracing', ent.name,
           `${jdg.holds ? '✓' : '✗'} ${jdg.claim.slice(0, 60)}`, r.clauseIndex);
       }
@@ -3237,7 +3278,7 @@ ${sourceBlock}
 DISTILLED READINGS so far:
 ${factLines || '  (none)'}
 
-Revise into ONE specific sentence (under 30 words) describing who or what ${ent.name} is in this text. Keep what the source supports. Drop what later clauses overturned. Be specific — name a role, an action, an attribute — not "${ent.name} is mentioned". If the source is too thin to support a claim, say so honestly.`
+Revise into ONE specific sentence (under 30 words) describing who or what ${ent.name} is in this text. Keep what the source supports. Drop what later clauses overturned. Be specific. ALSO declare what kind of conceptual move this revision is.`
             : `${epistemic}
 
 SITE: ${ent.name}
@@ -3249,30 +3290,97 @@ ${sourceBlock}
 DISTILLED READINGS:
 ${factLines || '  (none)'}
 
-Write ONE specific sentence (under 30 words) for who or what ${ent.name} is in this text. Stay close to what the source actually says.`;
+Write ONE specific sentence (under 30 words) for who or what ${ent.name} is in this text.`;
+          // Ask the model to declare what kind of conceptual move its
+          // revision is — so we can store it in EO notation. REC is the
+          // operator for changing the frame we are thinking about
+          // something in. SYN is composing what's there into a unified
+          // reading. NUL is no change.
           const hypReply = await llmEngine.chat.completions.create({
             messages: [
-              { role: 'system', content: 'You are building a working hypothesis about who or what a named site in a text is. Reply with ONE specific sentence and nothing else — no preamble, no quotes around it, no labels.' },
+              { role: 'system', content: `You are building a working hypothesis about a named site in a text. Reply with ONLY a JSON object (no prose, no markdown):
+{"h":"<one specific sentence under 30 words>",
+"move":"recast|refine|correct|hold",
+"why":"<a few words for why this move>"}
+
+"move":
+- "recast" = changing the FRAME — different role, category, or what kind of thing the site is. Use when the new reading is not just more detail but a different conception.
+- "refine" = same frame, more specific. Adding detail or sharpening, not changing what kind of thing the site is.
+- "correct" = the prior hypothesis had a factual error and this fixes it.
+- "hold" = nothing meaningful to add; the prior still stands.
+
+When there is no prior, use "refine".` },
               { role: 'user', content: entPrompt },
             ],
-            max_tokens: 90, temperature: 0.2,
+            max_tokens: 160, temperature: 0.2,
           });
-          const newHyp = stripPreamble((hypReply.choices[0]?.message?.content || '').trim());
+          const raw = (hypReply.choices[0]?.message?.content || '').trim();
+          let newHyp = '', move = 'refine', why = '';
+          try {
+            const cleaned = raw.replace(/```json\s*/g,'').replace(/```/g,'').trim();
+            const jsonStr = extractBalancedJson(cleaned) || cleaned.match(/\{[\s\S]+\}/)?.[0];
+            if(jsonStr) {
+              const j = JSON.parse(jsonStr);
+              newHyp = stripPreamble(String(j.h || j.hypothesis || '')).trim();
+              const m = String(j.move || j.kind || '').toLowerCase().trim();
+              if(['recast','refine','correct','hold'].includes(m)) move = m;
+              if(j.why) why = String(j.why).slice(0, 120);
+            }
+          } catch(_) {}
+          // Fallback: model returned just a sentence.
+          if(!newHyp) newHyp = stripPreamble(raw).slice(0, 350);
           if(newHyp && newHyp.length > 8 && newHyp.length < 400) {
+            const changed = !priorHyp || priorHyp !== newHyp;
+            // Map the declared move to an EO operator. This is the
+            // typed record of HOW the graph's understanding of this
+            // site is changing, stored in EO notation.
+            let eoOp, eoStance;
+            if(!priorHyp) {
+              eoOp = 'INS'; eoStance = 'Composing';
+            } else if(move === 'hold' || !changed) {
+              eoOp = 'NUL'; eoStance = 'Clearing';
+            } else if(move === 'recast') {
+              eoOp = 'REC'; eoStance = 'Composing';
+            } else if(move === 'correct') {
+              eoOp = 'REC'; eoStance = 'Dissecting';
+            } else {
+              eoOp = 'SYN'; eoStance = 'Composing';
+            }
+
             ent.priorHypotheses = ent.priorHypotheses || [];
             if(priorHyp && priorHyp !== newHyp) {
               ent.priorHypotheses.push({
                 text: priorHyp,
                 supersededAt: r.clauseIndex,
                 supersededBy: 'llm-revision',
+                supersedingMove: move,
+                supersedingOp: eoOp,
+                why,
                 factCountAtTime: ent._llmFactCount - 1,
               });
             }
-            ent.hypothesis = newHyp;
-            ent.hypothesisRev = (ent.hypothesisRev || 0) + 1;
+
+            // Per-site EO log: the typed record of moves that built the
+            // current working hypothesis.
+            ent.eoLog = ent.eoLog || [];
+            ent.eoLog.push({
+              op: eoOp, site: 'Entity', stance: eoStance,
+              ts: new Date().toISOString(),
+              clauseIndex: r.clauseIndex,
+              move, why,
+              hypothesisBefore: priorHyp || null,
+              hypothesisAfter: newHyp,
+            });
+
+            if(changed) {
+              ent.hypothesis = newHyp;
+              ent.hypothesisRev = (ent.hypothesisRev || 0) + 1;
+              ent.lastMove = move;
+              ent.lastMoveOp = eoOp;
+            }
             ent.hypothesisStatus = 'working';
-            emit('SYN', 'Entity', 'Composing', ent.name,
-              newHyp.slice(0, 80), r.clauseIndex);
+            emit(eoOp, 'Entity', eoStance, ent.name,
+              `${move}: ${newHyp.slice(0, 70)}`, r.clauseIndex);
           }
         } catch(_) { /* keep prior hypothesis on revision failure */ }
       }
@@ -3332,28 +3440,73 @@ ${docSourceBlock || '  (none above threshold)'}
 Write ONE sentence (under 35 words) for what this document is and what it is about. Do not invent an author.`;
             const revReply = await llmEngine.chat.completions.create({
               messages: [
-                { role: 'system', content: 'You are building a working hypothesis about a document. Reply with ONE specific sentence and nothing else — no preamble, no quotes.' },
+                { role: 'system', content: `You are building a working hypothesis about a document. Reply with ONLY a JSON object:
+{"h":"<one specific sentence under 35 words>",
+"move":"recast|refine|correct|hold",
+"why":"<a few words>"}
+
+"move": "recast" = changing the FRAME of what kind of text this is or what it's centrally about. "refine" = same frame, sharper. "correct" = the prior had an error. "hold" = nothing meaningful to add.
+When there is no prior, use "refine".` },
                 { role: 'user', content: docRevPrompt },
               ],
-              max_tokens: 110, temperature: 0.2,
+              max_tokens: 180, temperature: 0.2,
             });
-            const revised = stripPreamble((revReply.choices[0]?.message?.content || '').trim());
+            const rawDoc = (revReply.choices[0]?.message?.content || '').trim();
+            let revised = '', docMove = 'refine', docWhy = '';
+            try {
+              const cleaned = rawDoc.replace(/```json\s*/g,'').replace(/```/g,'').trim();
+              const jsonStr = extractBalancedJson(cleaned) || cleaned.match(/\{[\s\S]+\}/)?.[0];
+              if(jsonStr) {
+                const j = JSON.parse(jsonStr);
+                revised = stripPreamble(String(j.h || j.hypothesis || '')).trim();
+                const m = String(j.move || j.kind || '').toLowerCase().trim();
+                if(['recast','refine','correct','hold'].includes(m)) docMove = m;
+                if(j.why) docWhy = String(j.why).slice(0, 120);
+              }
+            } catch(_) {}
+            if(!revised) revised = stripPreamble(rawDoc).slice(0, 450);
             if(revised && revised.length > 15 && revised.length < 500) {
+              const changed = !prior || prior !== revised;
+              let docOp, docStance;
+              if(!prior) { docOp = 'INS'; docStance = 'Composing'; }
+              else if(docMove === 'hold' || !changed) { docOp = 'NUL'; docStance = 'Clearing'; }
+              else if(docMove === 'recast') { docOp = 'REC'; docStance = 'Composing'; }
+              else if(docMove === 'correct') { docOp = 'REC'; docStance = 'Dissecting'; }
+              else { docOp = 'SYN'; docStance = 'Composing'; }
+
               graph.hypotheses = graph.hypotheses || {};
               graph.hypotheses.priorDocs = graph.hypotheses.priorDocs || [];
               if(prior && prior !== revised) {
                 graph.hypotheses.priorDocs.push({
                   text: prior,
                   supersededAt: r.clauseIndex,
+                  supersedingMove: docMove,
+                  supersedingOp: docOp,
+                  why: docWhy,
                   entityCount: ranked.length,
                 });
               }
-              docHyp = revised;
-              graph.hypotheses.doc = revised;
-              graph.hypotheses.docRev = (graph.hypotheses.docRev || 0) + 1;
+
+              graph.hypotheses.docLog = graph.hypotheses.docLog || [];
+              graph.hypotheses.docLog.push({
+                op: docOp, site: 'Kind', stance: docStance,
+                ts: new Date().toISOString(),
+                clauseIndex: r.clauseIndex,
+                move: docMove, why: docWhy,
+                hypothesisBefore: prior || null,
+                hypothesisAfter: revised,
+              });
+
+              if(changed) {
+                docHyp = revised;
+                graph.hypotheses.doc = revised;
+                graph.hypotheses.docRev = (graph.hypotheses.docRev || 0) + 1;
+                graph.hypotheses.lastMove = docMove;
+                graph.hypotheses.lastMoveOp = docOp;
+              }
               graph.hypotheses.docStatus = 'working';
-              emit('SYN', 'Kind', 'Composing', 'doc-revision',
-                revised.slice(0, 100), r.clauseIndex);
+              emit(docOp, 'Kind', docStance, 'doc-revision',
+                `${docMove}: ${revised.slice(0, 80)}`, r.clauseIndex);
             }
           }
         } catch(_) { /* keep prior doc hypothesis on revision failure */ }
@@ -3944,23 +4097,41 @@ function renderReadings(){
   const fallbacks=readings.filter(r=>r.fallback).length;
   let html='';
 
+  // EO-op badge — small colored chip for the operator on a revision.
+  // REC (frame change) gets the warn color; SYN (refinement) the accent;
+  // NUL the dim. Lets you see at a glance whether a revision recast or
+  // just sharpened the prior.
+  const opBadge = (op, move) => {
+    if(!op) return '';
+    const col = op === 'REC' ? 'var(--warn)'
+      : op === 'SYN' ? 'var(--accent)'
+      : op === 'INS' ? '#5588aa'
+      : op === 'NUL' ? 'var(--dim)'
+      : 'var(--dim)';
+    const label = move ? `${op} · ${move}` : op;
+    return `<span style="display:inline-block;padding:0 5px;font-size:9px;border:1px solid ${col};color:${col};border-radius:2px;margin-right:6px;font-family:var(--mono);letter-spacing:0.04em">${label}</span>`;
+  };
+
   const hyps = graph.hypotheses || {};
   if(hyps.doc) {
     const docRev = hyps.docRev || 0;
     const revTag = docRev > 0 ? ` <span style="opacity:0.5;font-size:10px;font-weight:normal">rev ${docRev}</span>` : '';
-    html+=`<div class="hyp-box hyp-doc"><span class="hyp-label">WORKING HYP · DOC</span>${revTag} ${esc(hyps.doc)}</div>`;
+    const lastOpTag = opBadge(hyps.lastMoveOp, hyps.lastMove);
+    html+=`<div class="hyp-box hyp-doc"><span class="hyp-label">WORKING HYP · DOC</span>${revTag} ${lastOpTag}${esc(hyps.doc)}</div>`;
     // Show the trail of revisions so you can SEE the reading evolve.
     const priors = hyps.priorDocs || [];
     if(priors.length > 0) {
       html+=`<details style="margin:4px 0 8px 12px;font-size:11px;color:var(--dim)"><summary style="cursor:pointer;opacity:0.7">${priors.length} prior reading${priors.length===1?'':'s'} — overturned</summary>`;
       for(const p of priors) {
-        html+=`<div style="padding:2px 0;opacity:0.6"><span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s></div>`;
+        html+=`<div style="padding:2px 0;opacity:0.6">${opBadge(p.supersedingOp, p.supersedingMove)}<span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s>${p.why?`<span style="opacity:0.5;margin-left:6px">— ${esc(p.why)}</span>`:''}</div>`;
       }
       html+=`</details>`;
     }
   }
   // Site hypotheses — the model's evolving working hypothesis for who
-  // each named site is. The graph IS these hypotheses, not facts.
+  // each named site is. The graph IS these hypotheses, not facts. Each
+  // revision is stored as an EO event in ent.eoLog (REC when the frame
+  // changes, SYN when refined, NUL when held).
   const entHyps = Object.entries(graph.entities || {})
     .filter(([, e]) => e.hypothesis)
     .sort(([, a], [, b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
@@ -3970,14 +4141,15 @@ function renderReadings(){
     for(const [, e] of entHyps) {
       const priors = e.priorHypotheses || [];
       const rev = e.hypothesisRev || 0;
+      const lastOp = opBadge(e.lastMoveOp, e.lastMove);
       html+=`<div class="hyp-box" style="background:rgba(92,224,160,0.04);border-left:3px solid var(--green);font-size:12px">`;
       html+=`<span class="hyp-label" style="color:var(--green)">${esc(e.name)}</span>`;
       if(rev > 0) html+=` <span style="opacity:0.45;font-size:10px">rev ${rev}</span>`;
-      html+=` ${esc(e.hypothesis)}`;
+      html+=` ${lastOp}${esc(e.hypothesis)}`;
       if(priors.length > 0) {
         html+=`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:10px;opacity:0.5">${priors.length} overturned</summary>`;
         for(const p of priors) {
-          html+=`<div style="padding:1px 0;font-size:10px;opacity:0.55"><span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s></div>`;
+          html+=`<div style="padding:1px 0;font-size:10px;opacity:0.55">${opBadge(p.supersedingOp, p.supersedingMove)}<span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s>${p.why?`<span style="opacity:0.5;margin-left:6px">— ${esc(p.why)}</span>`:''}</div>`;
         }
         html+=`</details>`;
       }

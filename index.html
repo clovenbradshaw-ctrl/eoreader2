@@ -2568,11 +2568,21 @@ EXAMPLES — most have null link, null judge:
   let rawBuffer = [];
   let prevClauseText = '';
 
+  // Encode EVERY clause that isn't pure chrome. The model gets to read
+  // every non-chrome clause — even short, low-salience ones — because
+  // a short sentence like "He ended his run as host of 'The Late Show'
+  // on Thursday." can be the most important sentence in the doc but
+  // gets a low salience score from the embedding-based filter.
+  // Inert clauses go in too: the model can return empty facts if the
+  // sentence genuinely has nothing to read, and the schema's null
+  // defaults plus the grounding check keep that cheap.
   const readableClauses = allResults.filter(r =>
-    (r.rawType === 'clause' || r.rawType === 'revived') && r.rawType !== 'chrome'
+    r.rawType !== 'chrome'
   ).sort((a,b) => a.clauseIndex - b.clauseIndex);
 
-  const toRead = readableClauses.filter(r => !isChromey(r.clause));
+  const toRead = readableClauses.filter(r =>
+    !isChromey(r.clause) && (r.clause || '').trim().length >= 12
+  );
   const chromeSkipped = readableClauses.length - toRead.length;
 
   setProgress(0, toRead.length);
@@ -3057,8 +3067,17 @@ When there is no prior, use "refine".` },
 
       const hasReading = parsedFacts.length > 0 || parsedRelations.length > 0 || parsedJudgments.length > 0;
       if(!parsedOp && !fn && !hasReading) {
+        // Even when the LLM produces nothing useful, the clause still
+        // gets a SIG event in the graph: "this clause was read, here's
+        // what the mechanical layer thought it was about". That way
+        // every clause is literally encoded, and later hypothesis
+        // revision can come back to it.
         skipped++;
-        errors.push({ clause: r.clauseIndex, error: 'unparseable: ' + raw.slice(0, 60) });
+        emit('SIG', r.terrain?.name || 'Void', r.stance?.name || 'Clearing',
+          `c${r.clauseIndex + 1}`, 'read:empty', r.clauseIndex);
+        const gc = graph.clauses.find(c => c.index === r.clauseIndex);
+        if(gc && gc.stage !== 'folded') gc.stage = gc.stage === 'extracted' ? 'read-empty' : gc.stage;
+        errors.push({ clause: r.clauseIndex, error: 'no content extracted' });
         prevClauseText = r.clause;
         continue;
       }
@@ -3402,8 +3421,12 @@ When there is no prior, use "refine".` },
           }
           const sourceBlock = sourceSpans.join('\n');
 
+          // Live llm facts feeding the NEXT revision: skip claims that
+          // a prior revision already marked as superseded — we don't
+          // want the model trying to revise around its own corrected
+          // mistakes.
           const llmFacts = (ent.claims || [])
-            .filter(c => c.rawType === 'def-llm' || c.rawType === 'eva-llm')
+            .filter(c => (c.rawType === 'def-llm' || c.rawType === 'eva-llm') && !c.supersededBy)
             .slice(-6);
           const factLines = llmFacts.map(c =>
             (c.rawType === 'eva-llm' ? '  ⚖ ' : '  · ') + c.value
@@ -3528,6 +3551,56 @@ When there is no prior, use "refine".` },
             ent.hypothesisStatus = 'working';
             emit(eoOp, 'Entity', eoStance, ent.name,
               `${move}: ${newHyp.slice(0, 70)}`, r.clauseIndex);
+
+            // Hypothesis-driven graph fix: when the move is "correct"
+            // or "recast", walk back through this site's earlier
+            // llm-read claims and mark ones that clearly conflict with
+            // the new hypothesis as superseded. The graph then reflects
+            // the corrected reading rather than carrying the original
+            // wrong claim forward. Superseded claims are kept on the
+            // record (with .supersededBy + .supersedingClause) so the
+            // history is auditable; the live graph filters them out.
+            if(changed && (move === 'correct' || move === 'recast')) {
+              const newHypLow = newHyp.toLowerCase();
+              const newWords = new Set(
+                newHypLow.split(/\W+/).filter(w => w.length >= 4 &&
+                  !/^(with|from|that|this|have|been|were|will|would|could|should|about|which|while|where|when|what|some|then|than|into|over|under|after|before)$/.test(w))
+              );
+              let supersededN = 0;
+              for(const claim of (ent.claims || [])) {
+                if(claim.rawType !== 'def-llm') continue;
+                if(claim.supersededBy) continue;
+                if(claim.clauseIndex >= r.clauseIndex) continue;
+                const cv = String(claim.value || '').toLowerCase();
+                const cwords = cv.split(/\W+/).filter(w => w.length >= 4);
+                if(cwords.length === 0) continue;
+                const overlap = cwords.filter(w => newWords.has(w)).length;
+                const ratio = overlap / cwords.length;
+                // If the corrected hypothesis shares almost nothing
+                // (< 25%) with this earlier claim, the claim is likely
+                // the wrong reading the revision is correcting.
+                if(ratio < 0.25) {
+                  claim.supersededBy = 'hypothesis-revision';
+                  claim.supersedingClause = r.clauseIndex;
+                  claim.supersedingMove = move;
+                  claim.supersedingHypothesis = newHyp.slice(0, 200);
+                  supersededN++;
+                }
+              }
+              if(supersededN > 0) {
+                ent.eoLog = ent.eoLog || [];
+                ent.eoLog.push({
+                  op: 'NUL', site: 'Entity', stance: 'Dissecting',
+                  ts: new Date().toISOString(),
+                  clauseIndex: r.clauseIndex,
+                  move: 'supersede-prior',
+                  why: `${supersededN} earlier ${move === 'correct' ? 'incorrect' : 'reframed'} claim(s) marked superseded by ${move}`,
+                  supersededCount: supersededN,
+                });
+                emit('NUL', 'Entity', 'Dissecting', ent.name,
+                  `${move}: superseded ${supersededN} prior claim(s)`, r.clauseIndex);
+              }
+            }
           }
         } catch(_) { /* keep prior hypothesis on revision failure */ }
       }

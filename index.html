@@ -2494,24 +2494,28 @@ async function startReading(){
   // about them, what relations are drawn, and what the author judges.
   // The classification axes (q1/q2/q3) ride along but are no longer
   // the point of the call.
+  // The per-clause READ prompt. Asks the model to actually read the
+  // sentence and report what it says: who is named, what is said
+  // about them, what relations are drawn, what is judged. Op/site/
+  // stance for the clause are now DERIVED from this reading content
+  // (facts → DEF, links → CON, judges → EVA) — no separate axis
+  // classification, which a small model would just echo verbatim
+  // from any example given.
   const system=`You read ONE sentence and report what it says. Reply with ONLY a JSON object (no prose, no markdown, no code fence):
-{"fn":"what this sentence does (4-10 words)",
+{"fn":"what THIS sentence does — a short description (4-10 words), NOT a name",
 "facts":[{"e":"entity name","says":"attribute or action (4-14 words)"}],
 "link":{"from":"name A","to":"name B","how":"short verb"},
 "judge":{"about":"entity","claim":"what the text judges","holds":true},
 "sp":"speaker name or null","sd":0,
-"eq":"short=full or null",
-"q1":2,"q2":2,"q3":2}
+"eq":"short=full or null"}
 
-facts: each entry names ONE specific person/place/org/work and says what the sentence reports about it. Reuse names from [known: …] when they appear. Empty [] if no specific named subject.
-link: ONE main relation between two named things, or null. "how" is a short verb ("advises", "founded", "killed", "depends_on").
-judge: the author's evaluation of an entity or claim. null for most sentences.
+fn: a verb-phrase description of what the sentence DOES ("reports X", "introduces Y", "claims Z"). NEVER just an entity name. NEVER just a topic. A description.
+facts: each entry names ONE specific person/place/org/work and says what the sentence reports about it. Reuse names from priors when they appear. Empty [] if no specific named subject.
+link: ONE main relation between two named things, or null. "how" is a short verb ("advises", "founded", "killed", "cited"). null when the sentence has no clear two-thing relation.
+judge: the author's evaluation of an entity or claim, or null. Most sentences are null.
 sp: who is speaking the sentence (a person name) or null for the narrator.
 sd: 0=narrator/exposition, 1=quoted speech, 2=quote-within-quote.
 eq: alias map if a short form in this sentence refers to a known full name (e.g. "Walz=Tim Walz"); else null.
-q1: 1=separating 2=connecting 3=producing
-q2: 1=existence 2=organization 3=meaning
-q3: 1=background 2=particular 3=pattern
 
 HOW TO READ THE USER MESSAGE:
 - The bracketed blocks are PRIORS — what the reading so far has established. Confirm what holds, correct what this clause overturns. They are NOT constraints; this clause can introduce something new or contradict a prior.
@@ -2521,16 +2525,21 @@ HOW TO READ THE USER MESSAGE:
 - [fast-prior …] — the cheap mechanical reading of this clause. Treat as a hint, not a fact. Override when the actual sentence says otherwise.
 
 CRITICAL RULES:
-- "I", "me", "my", "we", "us" refer to the NARRATOR (the author of the text). They are NOT any named entity in the sentence. If the subject is "I", set facts:[] unless a named entity is also acting.
-- Attribute actions to the entity actually doing them. If the sentence says "I have asked X" do NOT say a named person mentioned later in the sentence asked X — that person is the OBJECT, not the subject.
-- Resolve pronouns (he, she, they, it) using the [carried forward …] list when no antecedent is in this clause. If no good match exists, set facts:[].
-- Stay close to what the sentence actually says. Do not invent facts about a site just because it is in the priors.
+- Stay inside THIS sentence. The priors are for orientation ONLY. Do NOT copy the working-hypothesis text from the priors into facts.says — facts.says must report what THIS sentence actually says. If a sentence does not say something new about a prior site, that site goes in NEITHER facts NOR link.
+- "I", "me", "my", "we", "us" refer to the NARRATOR. Not a named entity. If the subject is "I" with no named co-actor, set facts:[].
+- Attribute actions to the entity actually DOING them. "I have asked X about Y" → the narrator asked, X was asked, Y is the topic. Do not say Y did the asking just because Y is mentioned.
+- Resolve pronouns (he, she, they, it) using [carried forward …] only when there is a clear antecedent. If unclear, set facts:[].
+- fn is a description, not a tag. "reports the Mayor's announcement" ✓ — "Bill Lee" ✗.
+- If this clause is web chrome or boilerplate (a CTA, a header, a stray fragment, a subscription form prompt), output empty facts:[] and link:null. Do not invent connections just to have an answer.
 
 Example 1: "I have asked the Tennessean to correct its coverage, which cited John Buntin's report."
-→ {"fn":"narrator requests correction of coverage citing Buntin's report","facts":[{"e":"Tennessean","says":"was asked to correct its coverage"},{"e":"John Buntin","says":"wrote a report that was cited"}],"link":{"from":"Tennessean","to":"John Buntin","how":"cited"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}
+→ {"fn":"narrator requests correction of Tennessean's coverage of Buntin's report","facts":[{"e":"Tennessean","says":"was asked to correct its coverage"},{"e":"John Buntin","says":"wrote a report that was cited"}],"link":{"from":"Tennessean","to":"John Buntin","how":"cited"},"judge":null,"sp":null,"sd":0,"eq":null}
 
 Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
-→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}`;
+→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null}
+
+Example 3 — boilerplate / chrome: "Click here to become a member."
+→ {"fn":"call-to-action boilerplate","facts":[],"link":null,"judge":null,"sp":null,"sd":0,"eq":null}`;
 
   const allReadings = [];
   let corrections = 0, confirmations = 0, skipped = 0, errors = [];
@@ -2686,7 +2695,7 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
       (graph.entities[a].mentions?.length || 0);
 
     const namedRanked = [...inClauseKeys].sort(rankByMentions).slice(0, 5);
-    const carryRanked = [...carryKeys].sort(rankByMentions).slice(0, 3);
+    const carryRanked = [...carryKeys].sort(rankByMentions).slice(0, 2);
 
     const renderHyp = (key) => {
       const ent = graph.entities[key];
@@ -2754,7 +2763,6 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
       const raw = (reply.choices[0]?.message?.content || '').trim();
 
       let parsedOp = null, parsedSite = null, parsedStance = null, fn = null;
-      let parsedMode = null, parsedDomain = null, parsedObject = null;
       let parsedSpeaker = null, parsedSpeakerDepth = 0;
       let parsedSame = null, parsedLink = null;
       let parsedFacts = [];        // [{e, says}]   — DEF events
@@ -2824,85 +2832,27 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
             if(acceptReadName(about) && claim) parsedJudgments.push({ about, claim: claim.slice(0, 240), holds });
           }
 
-          // Speaker + alias passthrough (unchanged behaviour)
+          // Speaker + alias passthrough.
           if(j.sp && String(j.sp).toLowerCase() !== 'null') parsedSpeaker = String(j.sp).slice(0, 40);
           if(j.sd !== undefined && j.sd !== null) parsedSpeakerDepth = parseInt(j.sd) || 0;
           if(j.eq && typeof j.eq === 'string' && j.eq.includes('=') && j.eq !== 'short=full' && j.eq.toLowerCase() !== 'null') {
             parsedSame = j.eq;
           }
-
-          // Classification axes — still parsed, but now secondary.
-          // If the model omitted them, derive op/site/stance from the
-          // reading content below.
-          const q1 = (parseInt(j.q1||j.Q1||j['1']) || 0) - 1;
-          const q2 = (parseInt(j.q2||j.Q2||j['2']) || 0) - 1;
-          const q3 = (parseInt(j.q3||j.Q3||j['3']) || 0) - 1;
-          if(q1 >= 0 && q1 < 3 && q2 >= 0 && q2 < 3 && q3 >= 0 && q3 < 3) {
-            const MK = Object.keys(MODES);
-            const DK = Object.keys(DOMAINS);
-            const OK = Object.keys(OBJECTS);
-            parsedMode = MK[q1]; parsedDomain = DK[q2]; parsedObject = OK[q3];
-            parsedOp = OP_GRID[q1]?.[q2] || null;
-            parsedSite = SITE_GRID[q2]?.[q3] || null;
-            parsedStance = STANCE_GRID[q1]?.[q3] || null;
-          }
         }
       } catch(e) {}
 
-      // Reading-derived op/site/stance — used when the model didn't
-      // hand back numeric axes but DID actually read the sentence.
-      if(!parsedOp) {
-        if(parsedJudgments.length > 0) {
-          parsedOp = 'EVA'; parsedSite = 'Lens'; parsedStance = 'Tracing';
-        } else if(parsedRelations.length > 0) {
-          parsedOp = 'CON'; parsedSite = 'Network'; parsedStance = 'Binding';
-        } else if(parsedFacts.length > 0) {
-          parsedOp = 'DEF'; parsedSite = 'Entity'; parsedStance = 'Clearing';
-        }
-      }
-
-      if(!parsedOp) {
-        const numMatch = raw.match(/([1-3])\s*[,.\s]\s*([1-3])\s*[,.\s]\s*([1-3])\s*\|(.+)/);
-        if(numMatch) {
-          const q1 = parseInt(numMatch[1]) - 1;
-          const q2 = parseInt(numMatch[2]) - 1;
-          const q3 = parseInt(numMatch[3]) - 1;
-          const MK = Object.keys(MODES); const DK = Object.keys(DOMAINS); const OK = Object.keys(OBJECTS);
-          parsedMode = MK[q1]; parsedDomain = DK[q2]; parsedObject = OK[q3];
-          parsedOp = OP_GRID[q1]?.[q2] || null;
-          parsedSite = SITE_GRID[q2]?.[q3] || null;
-          parsedStance = STANCE_GRID[q1]?.[q3] || null;
-          fn = numMatch[4].trim().slice(0, 60);
-        }
-      }
-
-      if(!parsedOp) {
-        const lower = raw.toLowerCase();
-        const modeWords = {separating:0,connecting:1,producing:2,separate:0,connect:1,produce:2};
-        const domainWords = {existence:0,organization:1,meaning:2,exist:0,organ:1,mean:2};
-        const objectWords = {background:0,particular:1,pattern:2,backgr:0,partic:1,patt:2};
-        let q1=-1, q2=-1, q3=-1;
-        for(const[w,idx] of Object.entries(modeWords)){if(lower.includes(w)){q1=idx;break;}}
-        for(const[w,idx] of Object.entries(domainWords)){if(lower.includes(w)){q2=idx;break;}}
-        for(const[w,idx] of Object.entries(objectWords)){if(lower.includes(w)){q3=idx;break;}}
-        if(q1>=0 && q2>=0) {
-          parsedOp = OP_GRID[q1]?.[q2] || null;
-          if(q3>=0) { parsedSite = SITE_GRID[q2]?.[q3] || null; parsedStance = STANCE_GRID[q1]?.[q3] || null; }
-        }
-      }
-
-      if(!parsedOp) {
-        const digits = raw.match(/[1-3]/g);
-        if(digits && digits.length >= 2) {
-          const q1 = parseInt(digits[0]) - 1;
-          const q2 = parseInt(digits[1]) - 1;
-          const q3 = digits.length >= 3 ? parseInt(digits[2]) - 1 : 1;
-          if(q1>=0&&q1<3&&q2>=0&&q2<3) {
-            parsedOp = OP_GRID[q1]?.[q2] || null;
-            parsedSite = SITE_GRID[q2]?.[q3] || null;
-            parsedStance = STANCE_GRID[q1]?.[q3] || null;
-          }
-        }
+      // Op/site/stance for the clause derive from WHAT WAS READ:
+      // judgments → EVA, links → CON, facts → DEF. We deliberately do
+      // not ask the model for separate q1/q2/q3 axes — a small model
+      // just echoes whatever example values appear in the prompt,
+      // pinning every clause to the same operator (the bug that put
+      // CON(Link, Binding) on 100% of reads in a real session).
+      if(parsedJudgments.length > 0) {
+        parsedOp = 'EVA'; parsedSite = 'Lens'; parsedStance = 'Tracing';
+      } else if(parsedRelations.length > 0) {
+        parsedOp = 'CON'; parsedSite = 'Network'; parsedStance = 'Binding';
+      } else if(parsedFacts.length > 0) {
+        parsedOp = 'DEF'; parsedSite = 'Entity'; parsedStance = 'Clearing';
       }
 
       if(fn) fn = fn.replace(/>>>/g,'').replace(/<<</g,'').replace(/\[describe the sentence\]/gi,'').replace(/^This specific sentence /i,'').trim().slice(0,80);

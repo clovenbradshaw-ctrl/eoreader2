@@ -2257,13 +2257,19 @@ async function processText(text) {
       const entityList = topEntities.map(([n]) => n).join(', ');
       const idReply = await llmEngine.chat.completions.create({
         messages: [
-          { role: 'system', content: 'Identify this text in one sentence. What is it? Who wrote it? What genre?' },
-          { role: 'user', content: `Entities: ${entityList}\nShape: ${textShape}, ${clauseCount} passages\nOpening:\n${sample}\n\nKey passages:\n${surpriseSpans}` },
+          // Do NOT ask "who wrote it" — we don't pass a byline, so a small
+          // model will just confabulate from the most-mentioned name in the
+          // entity list (e.g. naming a council member as the author). Only
+          // ask what the text IS about.
+          { role: 'system', content: 'Identify this text in ONE sentence: what is it about and what kind of text is it (article, essay, post, report)? Do NOT name an author unless one is explicitly given. Do not invent a name. Under 25 words.' },
+          { role: 'user', content: `Named entities mentioned (these are subjects of the text, NOT the author):\n${entityList}\n\nShape: ${textShape}, ${clauseCount} passages\n\nOpening:\n${sample}\n\nKey passages:\n${surpriseSpans}` },
         ],
-        max_tokens: 60,
+        max_tokens: 80,
         temperature: 0.1,
       });
       const identification = (idReply.choices[0]?.message?.content || '').trim();
+      // First-pass doc hypothesis. May be wrong — the revision loop in
+      // the reading pass will rewrite it as entity hypotheses accumulate.
       if(identification.length > 10) {
         instantHyp = identification;
       }
@@ -2507,8 +2513,24 @@ q1: 1=separating 2=connecting 3=producing
 q2: 1=existence 2=organization 3=meaning
 q3: 1=background 2=particular 3=pattern
 
-Example input sentence: "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
-Example output: {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}`;
+HOW TO READ THE USER MESSAGE:
+- The bracketed blocks are PRIORS — what the reading so far has established. Confirm what holds, correct what this clause overturns. They are NOT constraints; this clause can introduce something new or contradict a prior.
+- [passage so far: …] — the rolling working hypothesis for the passage
+- [named in this clause — working hypotheses …] — sites named in this clause along with the current working hypothesis for each. Reuse these names. The hypotheses are revisable.
+- [carried forward from last N clauses …] — sites recently in scope. Any pronoun (he, she, they, it) in this clause likely refers to one of them — pick the best match.
+- [fast-prior …] — the cheap mechanical reading of this clause. Treat as a hint, not a fact. Override when the actual sentence says otherwise.
+
+CRITICAL RULES:
+- "I", "me", "my", "we", "us" refer to the NARRATOR (the author of the text). They are NOT any named entity in the sentence. If the subject is "I", set facts:[] unless a named entity is also acting.
+- Attribute actions to the entity actually doing them. If the sentence says "I have asked X" do NOT say a named person mentioned later in the sentence asked X — that person is the OBJECT, not the subject.
+- Resolve pronouns (he, she, they, it) using the [carried forward …] list when no antecedent is in this clause. If no good match exists, set facts:[].
+- Stay close to what the sentence actually says. Do not invent facts about a site just because it is in the priors.
+
+Example 1: "I have asked the Tennessean to correct its coverage, which cited John Buntin's report."
+→ {"fn":"narrator requests correction of coverage citing Buntin's report","facts":[{"e":"Tennessean","says":"was asked to correct its coverage"},{"e":"John Buntin","says":"wrote a report that was cited"}],"link":{"from":"Tennessean","to":"John Buntin","how":"cited"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}
+
+Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
+→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}`;
 
   const allReadings = [];
   let corrections = 0, confirmations = 0, skipped = 0, errors = [];
@@ -2608,23 +2630,78 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
 
     let user = '';
 
-    if(paraHyp) user += `[about: ${paraHyp.slice(0, 80)}]\n`;
+    // ── Predictive context ────────────────────────────────────
+    // Predictive processing: before the slow LLM read of this clause,
+    // we already have a prior — what the surrounding text was about,
+    // who is currently in scope, what the fast mechanical layer thinks
+    // this clause does. We give the model that prior so the read
+    // becomes prediction-error correction (confirm or overturn), not
+    // naive extraction from scratch.
+    if(paraHyp) user += `[passage so far: "${paraHyp.slice(0, 100)}"]\n`;
 
+    // Sites currently in scope: anyone named in THIS clause, plus
+    // anyone mentioned in the previous ~3 clauses (still in coref
+    // range, likely the antecedent of any pronoun in this clause).
     const clauseLower = r.clause.toLowerCase();
-    const knownInClause = Object.entries(graph.entities)
-      .filter(([key, ent]) => {
-        if(clauseLower.includes(key)) return true;
-        const parts = key.split(' ');
-        return parts.some(p => p.length >= 3 && clauseLower.includes(p));
-      })
-      .sort(([,a], [,b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
-      .slice(0, 6);
-    if(knownInClause.length > 0) {
-      const hints = knownInClause.map(([key, ent]) => {
-        const kind = (ent.claims||[]).find(c => c.rawType === 'kind');
-        return resolveEntity(key) + (kind ? ` (${kind.value})` : '');
-      });
-      user += `[known: ${hints.join(', ')}]\n`;
+    const inClauseKeys = new Set();
+    const carryWindow = 3;
+    const carryMin = r.clauseIndex - carryWindow;
+    const carryMax = r.clauseIndex - 1;
+    const carryKeys = new Set();
+
+    for(const [key, ent] of Object.entries(graph.entities)) {
+      // Match by canonical key or by any token of length ≥ 3.
+      const named = clauseLower.includes(key) ||
+        key.split(' ').some(p => p.length >= 3 && clauseLower.includes(p));
+      if(named) { inClauseKeys.add(key); continue; }
+      // Otherwise, was this site mentioned in the last few clauses?
+      if(ent.mentions && ent.mentions.some(m => m >= carryMin && m <= carryMax)) {
+        carryKeys.add(key);
+      }
+    }
+
+    const rankByMentions = (a, b) =>
+      (graph.entities[b].mentions?.length || 0) -
+      (graph.entities[a].mentions?.length || 0);
+
+    const namedRanked = [...inClauseKeys].sort(rankByMentions).slice(0, 5);
+    const carryRanked = [...carryKeys].sort(rankByMentions).slice(0, 3);
+
+    const renderHyp = (key) => {
+      const ent = graph.entities[key];
+      const kind = (ent.claims || []).find(c => c.rawType === 'kind');
+      const tag = resolveEntity(key) + (kind ? ` (${kind.value})` : '');
+      if(ent.hypothesis) return `${tag} — h: "${ent.hypothesis.slice(0, 110)}"`;
+      return tag;
+    };
+
+    if(namedRanked.length > 0) {
+      user += `[named in this clause — working hypotheses (revisable by this clause):\n  ${namedRanked.map(renderHyp).join('\n  ')}]\n`;
+    }
+    if(carryRanked.length > 0) {
+      // Carry-forward: sites recently in scope. Any pronoun in this
+      // clause probably refers to one of them. Listing them is the
+      // PRIOR for coreference resolution — the model should choose
+      // among these unless the clause clearly introduces something new.
+      user += `[carried forward from last ${carryWindow} clauses (likely referents for pronouns):\n  ${carryRanked.map(renderHyp).join('\n  ')}]\n`;
+    }
+
+    // Fast prior: what the mechanical extraction layer already produced
+    // for this clause. Embedding-classification has tagged an op/site/
+    // stance; the entity extractor has guessed at named subjects. This
+    // is the cheap, contextual reading the slow LLM read can confirm or
+    // overturn — predictive processing's fast pass.
+    const fastBits = [];
+    if(r.operator?.name && r.operator.name !== '—') {
+      fastBits.push(`op=${r.operator.name}(${r.terrain?.name||'?'}, ${r.stance?.name||'?'})`);
+    }
+    const fastSubjects = (r.claims || [])
+      .map(c => c.entity)
+      .filter(e => e && !String(e).startsWith('(') && e !== '?')
+      .slice(0, 4);
+    if(fastSubjects.length) fastBits.push(`subjects: ${[...new Set(fastSubjects)].join(', ')}`);
+    if(fastBits.length) {
+      user += `[fast-prior (mechanical reading; LLM may confirm or overturn): ${fastBits.join(' · ')}]\n`;
     }
 
     if(r.quoteState) {
@@ -2691,25 +2768,35 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
           // fn — the model's one-line reading of what the sentence does
           if(j.fn) fn = stripPreamble(String(j.fn)).slice(0, 80);
 
+          // Soft sanity for entity names — let the model say what it sees
+          // and let revision sort it out later. The only thing we drop is
+          // a bare narrator pronoun, because "I" can never be a named
+          // entity (it'd just create a literal "i" node).
+          const isBareNarrator = (s) => /^(i|me|my|we|us|our|you|your)$/i.test(String(s || '').trim());
+          const acceptReadName = (s) => {
+            const x = String(s || '').trim();
+            return !!x && x.length < 80 && !isBareNarrator(x);
+          };
+
           // facts — DEF events: what is said about each named entity
           if(Array.isArray(j.facts)) {
             for(const f of j.facts) {
               if(!f || typeof f !== 'object') continue;
               const e = String(f.e || f.entity || f.about || '').trim();
               const says = String(f.says || f.value || f.claim || '').trim();
-              if(e && says && e.length < 80 && says.length < 200) {
-                parsedFacts.push({ e, says });
-              }
+              if(!says || says.length >= 240) continue;
+              if(!acceptReadName(e)) continue;
+              parsedFacts.push({ e, says });
             }
           }
 
-          // link — single CON event (small models do better with one)
+          // link / links — CON events
           const linkRaw = j.link || j.relation;
           if(linkRaw && typeof linkRaw === 'object') {
             const from = String(linkRaw.from || linkRaw.a || '').trim();
             const to = String(linkRaw.to || linkRaw.b || '').trim();
             const how = String(linkRaw.how || linkRaw.rel || linkRaw.type || 'related_to').trim();
-            if(from && to && from.toLowerCase() !== to.toLowerCase()) {
+            if(acceptReadName(from) && acceptReadName(to) && from.toLowerCase() !== to.toLowerCase()) {
               parsedRelations.push({ from, to, how: how.slice(0, 40) });
               parsedLink = `${from} ${how} ${to}`;
             }
@@ -2720,7 +2807,7 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
               const from = String(lk.from || '').trim();
               const to = String(lk.to || '').trim();
               const how = String(lk.how || lk.rel || 'related_to').trim();
-              if(from && to && from.toLowerCase() !== to.toLowerCase()) {
+              if(acceptReadName(from) && acceptReadName(to) && from.toLowerCase() !== to.toLowerCase()) {
                 parsedRelations.push({ from, to, how: how.slice(0, 40) });
               }
             }
@@ -2732,7 +2819,7 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
             const about = String(judgeRaw.about || judgeRaw.e || '').trim();
             const claim = String(judgeRaw.claim || judgeRaw.says || '').trim();
             const holds = (judgeRaw.holds === false || judgeRaw.status === 'fails') ? false : true;
-            if(about && claim) parsedJudgments.push({ about, claim: claim.slice(0, 200), holds });
+            if(acceptReadName(about) && claim) parsedJudgments.push({ about, claim: claim.slice(0, 240), holds });
           }
 
           // Speaker + alias passthrough (unchanged behaviour)
@@ -2951,18 +3038,10 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
             }
           }
       }
-        if(newSite === 'Link' && parsedLink) {
-          const lk = parsedLink.toLowerCase();
-          if(!graph.entities[lk]) graph.entities[lk] = {
-            name: parsedLink, terrain:'Link', claims:[], edges:[], mentions:[], ledgers:{}, isLink:true
-          };
-          graph.entities[lk].claims.push({
-            entity: parsedLink, value: r.clause.slice(0,80), span: r.clause,
-            rawType:'relation', operator: newOp, site:'Link', resolution:'Binding',
-            notation:`${newOp}(Link,Binding)`, clauseIndex: r.clauseIndex, fn
-          });
-          graph.entities[lk].mentions.push(r.clauseIndex);
-        }
+        // (Removed: legacy synthetic Link-site entity creation. The
+        // LLM-read CON events below now populate graph.bindings and
+        // per-entity edges directly, so we no longer manufacture
+        // sentence-shaped "[LINK]" entities.)
 
       // ── Write LLM reading into the graph ──────────────────────
       // Resolve a free-form name from the model to a canonical entity key.
@@ -3083,6 +3162,202 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
         relations: parsedRelations,
         judgments: parsedJudgments,
       };
+
+      // ── Hypotheses evolve ─────────────────────────────────────
+      // The graph is a working hypothesis. Every entity ("site") has a
+      // one-sentence hypothesis for who/what it is. At intervals — keyed
+      // to how many times the site has been read — we revise that
+      // hypothesis, feeding the model BOTH the prior hypothesis AND a
+      // chunk of primary source content (the actual clauses the site
+      // appeared in). The model is allowed to keep, refine, or overturn
+      // the prior reading. The trail of revisions is preserved.
+      // (See HYPOTHESIS_ENTITY in the original eoReader prompts.js.)
+      const touchedEntityKeys = new Set();
+      for(const claim of newClaimsAdded) {
+        const k = (claim.entity || '').toLowerCase();
+        if(k) touchedEntityKeys.add(k);
+      }
+      for(const key of touchedEntityKeys) {
+        const ent = graph.entities[key];
+        if(!ent) continue;
+        ent._llmFactCount = (ent._llmFactCount || 0) + 1;
+        // Revise on 1st, 3rd, 6th, 10th… llm-read fact. Cheap early,
+        // sparse later, so sites with many mentions still get
+        // periodic re-evaluation without flooding the LLM.
+        const triggers = new Set([1, 3, 6, 10, 16, 24, 36]);
+        if(!triggers.has(ent._llmFactCount)) continue;
+        try {
+          // PRIMARY SOURCE: the actual clauses where this site appeared.
+          // Distilled facts compress reading; primary text lets the model
+          // SEE what the source actually says before revising. Cap to
+          // keep the prompt inside what tiny models can handle.
+          const seen = new Set();
+          const sourceSpans = [];
+          let charBudget = 1400;
+          const clauseRecs = (ent.mentions || [])
+            .map(idx => allResults.find(ar => ar.clauseIndex === idx))
+            .filter(Boolean);
+          // Most recent + earliest mention first — gives the model both
+          // how the site was introduced and how it is currently being used.
+          const ordered = [
+            ...clauseRecs.slice(-5).reverse(),
+            ...clauseRecs.slice(0, 2),
+          ];
+          for(const cr of ordered) {
+            if(seen.has(cr.clauseIndex)) continue;
+            const txt = (cr.clause || '').trim().slice(0, 280);
+            if(!txt) continue;
+            if(txt.length > charBudget) break;
+            sourceSpans.push(`  [c${cr.clauseIndex + 1}] "${txt}"`);
+            seen.add(cr.clauseIndex);
+            charBudget -= txt.length + 10;
+          }
+          const sourceBlock = sourceSpans.join('\n');
+
+          const llmFacts = (ent.claims || [])
+            .filter(c => c.rawType === 'def-llm' || c.rawType === 'eva-llm')
+            .slice(-6);
+          const factLines = llmFacts.map(c =>
+            (c.rawType === 'eva-llm' ? '  ⚖ ' : '  · ') + c.value
+          ).join('\n');
+
+          const priorHyp = ent.hypothesis;
+          const revCount = (ent.priorHypotheses || []).length;
+          const epistemic = `This is a WORKING HYPOTHESIS — a provisional reading. Later evidence may overturn it. Build on the prior reading; do not restart from scratch.`;
+          const entPrompt = priorHyp
+            ? `${epistemic}
+
+SITE: ${ent.name}
+PRIOR WORKING HYPOTHESIS (rev ${revCount}):
+"${priorHyp}"
+
+PRIMARY SOURCE — clauses in which ${ent.name} appears (verbatim):
+${sourceBlock}
+
+DISTILLED READINGS so far:
+${factLines || '  (none)'}
+
+Revise into ONE specific sentence (under 30 words) describing who or what ${ent.name} is in this text. Keep what the source supports. Drop what later clauses overturned. Be specific — name a role, an action, an attribute — not "${ent.name} is mentioned". If the source is too thin to support a claim, say so honestly.`
+            : `${epistemic}
+
+SITE: ${ent.name}
+(no prior hypothesis — first reading)
+
+PRIMARY SOURCE — clauses in which ${ent.name} appears (verbatim):
+${sourceBlock}
+
+DISTILLED READINGS:
+${factLines || '  (none)'}
+
+Write ONE specific sentence (under 30 words) for who or what ${ent.name} is in this text. Stay close to what the source actually says.`;
+          const hypReply = await llmEngine.chat.completions.create({
+            messages: [
+              { role: 'system', content: 'You are building a working hypothesis about who or what a named site in a text is. Reply with ONE specific sentence and nothing else — no preamble, no quotes around it, no labels.' },
+              { role: 'user', content: entPrompt },
+            ],
+            max_tokens: 90, temperature: 0.2,
+          });
+          const newHyp = stripPreamble((hypReply.choices[0]?.message?.content || '').trim());
+          if(newHyp && newHyp.length > 8 && newHyp.length < 400) {
+            ent.priorHypotheses = ent.priorHypotheses || [];
+            if(priorHyp && priorHyp !== newHyp) {
+              ent.priorHypotheses.push({
+                text: priorHyp,
+                supersededAt: r.clauseIndex,
+                supersededBy: 'llm-revision',
+                factCountAtTime: ent._llmFactCount - 1,
+              });
+            }
+            ent.hypothesis = newHyp;
+            ent.hypothesisRev = (ent.hypothesisRev || 0) + 1;
+            ent.hypothesisStatus = 'working';
+            emit('SYN', 'Entity', 'Composing', ent.name,
+              newHyp.slice(0, 80), r.clauseIndex);
+          }
+        } catch(_) { /* keep prior hypothesis on revision failure */ }
+      }
+
+      // Every ~20 clauses, re-evaluate the doc working hypothesis using
+      // the best site hypotheses we've accumulated, plus a few of the
+      // highest-salience source clauses as primary text. The model can
+      // — and should — overturn the early doc-id guess if later
+      // evidence points elsewhere.
+      if(i > 0 && i % 20 === 0) {
+        try {
+          const ranked = Object.entries(graph.entities)
+            .filter(([, e]) => e.hypothesis)
+            .sort(([, a], [, b]) =>
+              (b.mentions?.length || 0) - (a.mentions?.length || 0))
+            .slice(0, 8);
+          if(ranked.length >= 2) {
+            const entLines = ranked.map(([, e]) =>
+              `  • ${e.name}: ${e.hypothesis}`).join('\n');
+            // Primary-source sample for the doc hypothesis — high-salience
+            // clauses we've read so far, capped so the prompt stays small.
+            const readSoFar = allReadings.map(ar => ar.clauseIndex);
+            const readSet = new Set(readSoFar);
+            const docSourcePicks = [...allResults]
+              .filter(ar => readSet.has(ar.clauseIndex) && (ar.salience || 0) > 0.25)
+              .sort((a, b) => (b.salience || 0) - (a.salience || 0))
+              .slice(0, 5);
+            const docSourceBlock = docSourcePicks
+              .sort((a, b) => a.clauseIndex - b.clauseIndex)
+              .map(ar => `  [c${ar.clauseIndex + 1}] "${(ar.clause || '').trim().slice(0, 220)}"`)
+              .join('\n');
+
+            const prior = docHyp || graph.hypotheses?.doc || '';
+            const priorRevs = (graph.hypotheses?.priorDocs || []).length;
+            const epistemic = `This is a WORKING HYPOTHESIS about the document — provisional, may be overturned by later reading.`;
+            const docRevPrompt = prior
+              ? `${epistemic}
+
+PRIOR WORKING HYPOTHESIS (rev ${priorRevs}):
+"${prior}"
+
+WORKING HYPOTHESES about the main sites in this text:
+${entLines}
+
+PRIMARY SOURCE — high-salience clauses read so far (verbatim):
+${docSourceBlock || '  (none above threshold)'}
+
+Revise into ONE sentence (under 35 words) for what this document is and what it is about. Build on the prior reading. Overturn it if the sites and source contradict it. Do not invent an author — only state authorship if a site hypothesis directly supports it.`
+              : `${epistemic}
+
+WORKING HYPOTHESES about the main sites in this text:
+${entLines}
+
+PRIMARY SOURCE — high-salience clauses read so far (verbatim):
+${docSourceBlock || '  (none above threshold)'}
+
+Write ONE sentence (under 35 words) for what this document is and what it is about. Do not invent an author.`;
+            const revReply = await llmEngine.chat.completions.create({
+              messages: [
+                { role: 'system', content: 'You are building a working hypothesis about a document. Reply with ONE specific sentence and nothing else — no preamble, no quotes.' },
+                { role: 'user', content: docRevPrompt },
+              ],
+              max_tokens: 110, temperature: 0.2,
+            });
+            const revised = stripPreamble((revReply.choices[0]?.message?.content || '').trim());
+            if(revised && revised.length > 15 && revised.length < 500) {
+              graph.hypotheses = graph.hypotheses || {};
+              graph.hypotheses.priorDocs = graph.hypotheses.priorDocs || [];
+              if(prior && prior !== revised) {
+                graph.hypotheses.priorDocs.push({
+                  text: prior,
+                  supersededAt: r.clauseIndex,
+                  entityCount: ranked.length,
+                });
+              }
+              docHyp = revised;
+              graph.hypotheses.doc = revised;
+              graph.hypotheses.docRev = (graph.hypotheses.docRev || 0) + 1;
+              graph.hypotheses.docStatus = 'working';
+              emit('SYN', 'Kind', 'Composing', 'doc-revision',
+                revised.slice(0, 100), r.clauseIndex);
+            }
+          }
+        } catch(_) { /* keep prior doc hypothesis on revision failure */ }
+      }
 
       prevClauseText = r.clause;
 
@@ -3671,7 +3946,43 @@ function renderReadings(){
 
   const hyps = graph.hypotheses || {};
   if(hyps.doc) {
-    html+=`<div class="hyp-box hyp-doc"><span class="hyp-label">DOC</span> ${esc(hyps.doc)}</div>`;
+    const docRev = hyps.docRev || 0;
+    const revTag = docRev > 0 ? ` <span style="opacity:0.5;font-size:10px;font-weight:normal">rev ${docRev}</span>` : '';
+    html+=`<div class="hyp-box hyp-doc"><span class="hyp-label">WORKING HYP · DOC</span>${revTag} ${esc(hyps.doc)}</div>`;
+    // Show the trail of revisions so you can SEE the reading evolve.
+    const priors = hyps.priorDocs || [];
+    if(priors.length > 0) {
+      html+=`<details style="margin:4px 0 8px 12px;font-size:11px;color:var(--dim)"><summary style="cursor:pointer;opacity:0.7">${priors.length} prior reading${priors.length===1?'':'s'} — overturned</summary>`;
+      for(const p of priors) {
+        html+=`<div style="padding:2px 0;opacity:0.6"><span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s></div>`;
+      }
+      html+=`</details>`;
+    }
+  }
+  // Site hypotheses — the model's evolving working hypothesis for who
+  // each named site is. The graph IS these hypotheses, not facts.
+  const entHyps = Object.entries(graph.entities || {})
+    .filter(([, e]) => e.hypothesis)
+    .sort(([, a], [, b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
+    .slice(0, 10);
+  if(entHyps.length > 0) {
+    html+=`<div class="section-label" style="margin-top:8px;opacity:0.7">sites · working hypotheses (revisable)</div>`;
+    for(const [, e] of entHyps) {
+      const priors = e.priorHypotheses || [];
+      const rev = e.hypothesisRev || 0;
+      html+=`<div class="hyp-box" style="background:rgba(92,224,160,0.04);border-left:3px solid var(--green);font-size:12px">`;
+      html+=`<span class="hyp-label" style="color:var(--green)">${esc(e.name)}</span>`;
+      if(rev > 0) html+=` <span style="opacity:0.45;font-size:10px">rev ${rev}</span>`;
+      html+=` ${esc(e.hypothesis)}`;
+      if(priors.length > 0) {
+        html+=`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:10px;opacity:0.5">${priors.length} overturned</summary>`;
+        for(const p of priors) {
+          html+=`<div style="padding:1px 0;font-size:10px;opacity:0.55"><span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s></div>`;
+        }
+        html+=`</details>`;
+      }
+      html+=`</div>`;
+    }
   }
   if(hyps.sections && hyps.sections.length > 0) {
     for(const s of hyps.sections) {

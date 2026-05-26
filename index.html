@@ -2613,6 +2613,143 @@ Example 3 — boilerplate / chrome: "Click here to become a member."
     return null;
   }
 
+  // Doc working hypothesis evolves at intervals, on each new section,
+  // and at end of reading. Pulls the strongest site hypotheses plus a
+  // handful of high-salience source clauses and asks the model to
+  // refine, recast, correct, or hold. Returns true if the hypothesis
+  // changed.
+  async function reviseDocHypothesis(atClauseIdx, trigger) {
+    if(!llmEngine) return false;
+    try {
+      const ranked = Object.entries(graph.entities)
+        .filter(([, e]) => e.hypothesis)
+        .sort(([, a], [, b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
+        .slice(0, 8);
+      // Only revise if we have something to revise FROM. On a tiny
+      // sample (1 entity), the prior reading is as good as we can get.
+      if(ranked.length < 2 && (sectionHyps || []).length < 1) return false;
+
+      const entLines = ranked.map(([, e]) =>
+        `  • ${e.name}: ${e.hypothesis}`).join('\n') || '  (no site hypotheses yet)';
+
+      const secLines = (sectionHyps || [])
+        .slice(-6)
+        .map((s, j) => `  ${j + 1}. [c${(s.from||0)+1}–c${(s.to||0)+1}] ${s.text}`)
+        .join('\n');
+
+      const readSet = new Set(allReadings.map(ar => ar.clauseIndex));
+      const docSourcePicks = [...allResults]
+        .filter(ar => readSet.has(ar.clauseIndex) && (ar.salience || 0) > 0.25)
+        .sort((a, b) => (b.salience || 0) - (a.salience || 0))
+        .slice(0, 5);
+      const docSourceBlock = docSourcePicks
+        .sort((a, b) => a.clauseIndex - b.clauseIndex)
+        .map(ar => `  [c${ar.clauseIndex + 1}] "${(ar.clause || '').trim().slice(0, 220)}"`)
+        .join('\n');
+
+      const prior = docHyp || graph.hypotheses?.doc || '';
+      const priorRevs = (graph.hypotheses?.priorDocs || []).length;
+      const epistemic = `This is a WORKING HYPOTHESIS about the document — provisional, may be overturned by later reading.`;
+      const sectionsBlock = secLines ? `\n\nSECTION WORKING HYPOTHESES (rolling — the passage's read so far):\n${secLines}` : '';
+      const docRevPrompt = prior
+        ? `${epistemic}
+
+PRIOR WORKING HYPOTHESIS (rev ${priorRevs}):
+"${prior}"
+
+WORKING HYPOTHESES about the main sites in this text:
+${entLines}${sectionsBlock}
+
+PRIMARY SOURCE — high-salience clauses read so far (verbatim):
+${docSourceBlock || '  (none above threshold)'}
+
+Revise into ONE sentence (under 35 words) for what this document is and what it is about. Build on the prior reading. Overturn it if the sites, the sections, or the source contradict it. Do not invent an author — only state authorship if a site hypothesis directly supports it.`
+        : `${epistemic}
+
+WORKING HYPOTHESES about the main sites in this text:
+${entLines}${sectionsBlock}
+
+PRIMARY SOURCE — high-salience clauses read so far (verbatim):
+${docSourceBlock || '  (none above threshold)'}
+
+Write ONE sentence (under 35 words) for what this document is and what it is about. Do not invent an author.`;
+
+      const revReply = await llmEngine.chat.completions.create({
+        messages: [
+          { role: 'system', content: `You are building a working hypothesis about a document. Reply with ONLY a JSON object:
+{"h":"<one specific sentence under 35 words>",
+"move":"recast|refine|correct|hold",
+"why":"<a few words>"}
+
+"move": "recast" = changing the FRAME of what kind of text this is or what it's centrally about. "refine" = same frame, sharper. "correct" = the prior had an error. "hold" = nothing meaningful to add.
+When there is no prior, use "refine".` },
+          { role: 'user', content: docRevPrompt },
+        ],
+        max_tokens: 180, temperature: 0.2,
+      });
+      const rawDoc = (revReply.choices[0]?.message?.content || '').trim();
+      let revised = '', docMove = 'refine', docWhy = '';
+      try {
+        const cleaned = rawDoc.replace(/```json\s*/g,'').replace(/```/g,'').trim();
+        const jsonStr = extractBalancedJson(cleaned) || cleaned.match(/\{[\s\S]+\}/)?.[0];
+        if(jsonStr) {
+          const j = JSON.parse(jsonStr);
+          revised = stripPreamble(String(j.h || j.hypothesis || '')).trim();
+          const m = String(j.move || j.kind || '').toLowerCase().trim();
+          if(['recast','refine','correct','hold'].includes(m)) docMove = m;
+          if(j.why) docWhy = String(j.why).slice(0, 120);
+        }
+      } catch(_) {}
+      if(!revised) revised = stripPreamble(rawDoc).slice(0, 450);
+      if(revised && revised.length > 15 && revised.length < 500) {
+        const changed = !prior || prior !== revised;
+        let docOp, docStance;
+        if(!prior) { docOp = 'INS'; docStance = 'Composing'; }
+        else if(docMove === 'hold' || !changed) { docOp = 'NUL'; docStance = 'Clearing'; }
+        else if(docMove === 'recast') { docOp = 'REC'; docStance = 'Composing'; }
+        else if(docMove === 'correct') { docOp = 'REC'; docStance = 'Dissecting'; }
+        else { docOp = 'SYN'; docStance = 'Composing'; }
+
+        graph.hypotheses = graph.hypotheses || {};
+        graph.hypotheses.priorDocs = graph.hypotheses.priorDocs || [];
+        if(prior && prior !== revised) {
+          graph.hypotheses.priorDocs.push({
+            text: prior,
+            supersededAt: atClauseIdx,
+            supersedingMove: docMove,
+            supersedingOp: docOp,
+            why: docWhy,
+            trigger,
+            entityCount: ranked.length,
+          });
+        }
+
+        graph.hypotheses.docLog = graph.hypotheses.docLog || [];
+        graph.hypotheses.docLog.push({
+          op: docOp, site: 'Kind', stance: docStance,
+          ts: new Date().toISOString(),
+          clauseIndex: atClauseIdx,
+          move: docMove, why: docWhy, trigger,
+          hypothesisBefore: prior || null,
+          hypothesisAfter: revised,
+        });
+
+        if(changed) {
+          docHyp = revised;
+          graph.hypotheses.doc = revised;
+          graph.hypotheses.docRev = (graph.hypotheses.docRev || 0) + 1;
+          graph.hypotheses.lastMove = docMove;
+          graph.hypotheses.lastMoveOp = docOp;
+        }
+        graph.hypotheses.docStatus = 'working';
+        emit(docOp, 'Kind', docStance, 'doc-revision',
+          `${docMove} (${trigger}): ${revised.slice(0, 70)}`, atClauseIdx);
+        return changed;
+      }
+    } catch(_) { /* keep prior doc hypothesis on revision failure */ }
+    return false;
+  }
+
   for(let i = 0; i < toRead.length; i++){
     if(readingPriorityQueue.length > 0) {
       const pIdx = readingPriorityQueue.shift();
@@ -2642,18 +2779,11 @@ Example 3 — boilerplate / chrome: "Click here to become a member."
       rawBuffer = [];
       sectionStart = r.clauseIndex;
 
-      if(sectionHyps.length > 0 && sectionHyps.length % 3 === 0) {
-        try {
-          const docPrompt = docHyp
-            ? `Current understanding of this text:\n"${docHyp}"\n\nNew section:\n"${sectionHyps[sectionHyps.length-1].text}"\n\nRevise your understanding. One sentence. Keep what holds, add what's new.`
-            : `These are sections of a text:\n${sectionHyps.map((s,j) => `${j+1}. ${s.text}`).join('\n')}\n\nOne sentence summary. Under 20 words.`;
-          const compReply = await llmEngine.chat.completions.create({
-            messages:[{role:'user',content:docPrompt}],
-            max_tokens: 40, temperature: 0.1,
-          });
-          docHyp = stripPreamble((compReply.choices[0]?.message?.content || '').trim());
-        } catch(e) { /* keep existing docHyp */ }
-      }
+      // A new section landed — revise the doc working hypothesis
+      // against the updated section trail. Sections are the natural
+      // rollup level for the doc, so each one is a chance to refine
+      // or recast.
+      await reviseDocHypothesis(r.clauseIndex, 'new-section');
     }
 
     rawBuffer.push(r.clause.slice(0, 150));
@@ -3335,131 +3465,13 @@ When there is no prior, use "refine".` },
         } catch(_) { /* keep prior hypothesis on revision failure */ }
       }
 
-      // Every ~20 clauses, re-evaluate the doc working hypothesis using
-      // the best site hypotheses we've accumulated, plus a few of the
-      // highest-salience source clauses as primary text. The model can
-      // — and should — overturn the early doc-id guess if later
-      // evidence points elsewhere.
-      if(i > 0 && i % 20 === 0) {
-        try {
-          const ranked = Object.entries(graph.entities)
-            .filter(([, e]) => e.hypothesis)
-            .sort(([, a], [, b]) =>
-              (b.mentions?.length || 0) - (a.mentions?.length || 0))
-            .slice(0, 8);
-          if(ranked.length >= 2) {
-            const entLines = ranked.map(([, e]) =>
-              `  • ${e.name}: ${e.hypothesis}`).join('\n');
-            // Primary-source sample for the doc hypothesis — high-salience
-            // clauses we've read so far, capped so the prompt stays small.
-            const readSoFar = allReadings.map(ar => ar.clauseIndex);
-            const readSet = new Set(readSoFar);
-            const docSourcePicks = [...allResults]
-              .filter(ar => readSet.has(ar.clauseIndex) && (ar.salience || 0) > 0.25)
-              .sort((a, b) => (b.salience || 0) - (a.salience || 0))
-              .slice(0, 5);
-            const docSourceBlock = docSourcePicks
-              .sort((a, b) => a.clauseIndex - b.clauseIndex)
-              .map(ar => `  [c${ar.clauseIndex + 1}] "${(ar.clause || '').trim().slice(0, 220)}"`)
-              .join('\n');
-
-            const prior = docHyp || graph.hypotheses?.doc || '';
-            const priorRevs = (graph.hypotheses?.priorDocs || []).length;
-            const epistemic = `This is a WORKING HYPOTHESIS about the document — provisional, may be overturned by later reading.`;
-            const docRevPrompt = prior
-              ? `${epistemic}
-
-PRIOR WORKING HYPOTHESIS (rev ${priorRevs}):
-"${prior}"
-
-WORKING HYPOTHESES about the main sites in this text:
-${entLines}
-
-PRIMARY SOURCE — high-salience clauses read so far (verbatim):
-${docSourceBlock || '  (none above threshold)'}
-
-Revise into ONE sentence (under 35 words) for what this document is and what it is about. Build on the prior reading. Overturn it if the sites and source contradict it. Do not invent an author — only state authorship if a site hypothesis directly supports it.`
-              : `${epistemic}
-
-WORKING HYPOTHESES about the main sites in this text:
-${entLines}
-
-PRIMARY SOURCE — high-salience clauses read so far (verbatim):
-${docSourceBlock || '  (none above threshold)'}
-
-Write ONE sentence (under 35 words) for what this document is and what it is about. Do not invent an author.`;
-            const revReply = await llmEngine.chat.completions.create({
-              messages: [
-                { role: 'system', content: `You are building a working hypothesis about a document. Reply with ONLY a JSON object:
-{"h":"<one specific sentence under 35 words>",
-"move":"recast|refine|correct|hold",
-"why":"<a few words>"}
-
-"move": "recast" = changing the FRAME of what kind of text this is or what it's centrally about. "refine" = same frame, sharper. "correct" = the prior had an error. "hold" = nothing meaningful to add.
-When there is no prior, use "refine".` },
-                { role: 'user', content: docRevPrompt },
-              ],
-              max_tokens: 180, temperature: 0.2,
-            });
-            const rawDoc = (revReply.choices[0]?.message?.content || '').trim();
-            let revised = '', docMove = 'refine', docWhy = '';
-            try {
-              const cleaned = rawDoc.replace(/```json\s*/g,'').replace(/```/g,'').trim();
-              const jsonStr = extractBalancedJson(cleaned) || cleaned.match(/\{[\s\S]+\}/)?.[0];
-              if(jsonStr) {
-                const j = JSON.parse(jsonStr);
-                revised = stripPreamble(String(j.h || j.hypothesis || '')).trim();
-                const m = String(j.move || j.kind || '').toLowerCase().trim();
-                if(['recast','refine','correct','hold'].includes(m)) docMove = m;
-                if(j.why) docWhy = String(j.why).slice(0, 120);
-              }
-            } catch(_) {}
-            if(!revised) revised = stripPreamble(rawDoc).slice(0, 450);
-            if(revised && revised.length > 15 && revised.length < 500) {
-              const changed = !prior || prior !== revised;
-              let docOp, docStance;
-              if(!prior) { docOp = 'INS'; docStance = 'Composing'; }
-              else if(docMove === 'hold' || !changed) { docOp = 'NUL'; docStance = 'Clearing'; }
-              else if(docMove === 'recast') { docOp = 'REC'; docStance = 'Composing'; }
-              else if(docMove === 'correct') { docOp = 'REC'; docStance = 'Dissecting'; }
-              else { docOp = 'SYN'; docStance = 'Composing'; }
-
-              graph.hypotheses = graph.hypotheses || {};
-              graph.hypotheses.priorDocs = graph.hypotheses.priorDocs || [];
-              if(prior && prior !== revised) {
-                graph.hypotheses.priorDocs.push({
-                  text: prior,
-                  supersededAt: r.clauseIndex,
-                  supersedingMove: docMove,
-                  supersedingOp: docOp,
-                  why: docWhy,
-                  entityCount: ranked.length,
-                });
-              }
-
-              graph.hypotheses.docLog = graph.hypotheses.docLog || [];
-              graph.hypotheses.docLog.push({
-                op: docOp, site: 'Kind', stance: docStance,
-                ts: new Date().toISOString(),
-                clauseIndex: r.clauseIndex,
-                move: docMove, why: docWhy,
-                hypothesisBefore: prior || null,
-                hypothesisAfter: revised,
-              });
-
-              if(changed) {
-                docHyp = revised;
-                graph.hypotheses.doc = revised;
-                graph.hypotheses.docRev = (graph.hypotheses.docRev || 0) + 1;
-                graph.hypotheses.lastMove = docMove;
-                graph.hypotheses.lastMoveOp = docOp;
-              }
-              graph.hypotheses.docStatus = 'working';
-              emit(docOp, 'Kind', docStance, 'doc-revision',
-                `${docMove}: ${revised.slice(0, 80)}`, r.clauseIndex);
-            }
-          }
-        } catch(_) { /* keep prior doc hypothesis on revision failure */ }
+      // The doc working hypothesis evolves like a site hypothesis does:
+      // fired at clause intervals, fired whenever a new section
+      // hypothesis lands (sections are natural rollups), and once
+      // unconditionally at end of reading. See reviseDocHypothesis
+      // helper below.
+      if(i > 0 && i % 8 === 0) {
+        await reviseDocHypothesis(r.clauseIndex, 'interval');
       }
 
       prevClauseText = r.clause;
@@ -3503,16 +3515,11 @@ When there is no prior, use "refine".` },
     sectionHyps.push({ text: paraHyp, from: sectionStart, to: toRead.length > 0 ? toRead[toRead.length-1].clauseIndex : 0 });
   }
 
-  if(!docHyp && sectionHyps.length >= 2 && llmEngine) {
-    try {
-      const docPrompt = `These are sections of a text:\n${sectionHyps.map((s,j) => `${j+1}. ${s.text}`).join('\n')}\n\nOne sentence about what this text is. Under 20 words.`;
-      const compReply = await llmEngine.chat.completions.create({
-        messages:[{role:'user',content:docPrompt}],
-        max_tokens: 40, temperature: 0.1,
-      });
-      docHyp = stripPreamble((compReply.choices[0]?.message?.content || '').trim());
-    } catch(e) {}
-  }
+  // Final pass: revise the doc working hypothesis against EVERYTHING
+  // we've accumulated. Runs unconditionally so even short docs (where
+  // the interval-based revision never fired) get one rollup at the end.
+  const finalIdx = toRead.length > 0 ? toRead[toRead.length - 1].clauseIndex : 0;
+  await reviseDocHypothesis(finalIdx, 'final');
 
   graph.hypotheses = {
     doc: docHyp || graph.hypotheses?.doc || '',

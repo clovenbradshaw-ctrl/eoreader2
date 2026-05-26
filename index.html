@@ -2482,15 +2482,33 @@ async function startReading(){
     ['Cultivating','Making','Composing'],
   ];
 
-  const system=`Reply with ONLY a JSON object. No other text.
-{"q1":N,"q2":N,"q3":N,"fn":"what it does","sp":null,"sd":0,"eq":null}
+  // System prompt — adapted from the original eoReader INGEST prompt
+  // (see js/prompts.js in clovenbradshaw-ctrl/eoreader). Asks the local
+  // model to actually READ the sentence: who is named, what is said
+  // about them, what relations are drawn, and what the author judges.
+  // The classification axes (q1/q2/q3) ride along but are no longer
+  // the point of the call.
+  const system=`You read ONE sentence and report what it says. Reply with ONLY a JSON object (no prose, no markdown, no code fence):
+{"fn":"what this sentence does (4-10 words)",
+"facts":[{"e":"entity name","says":"attribute or action (4-14 words)"}],
+"link":{"from":"name A","to":"name B","how":"short verb"},
+"judge":{"about":"entity","claim":"what the text judges","holds":true},
+"sp":"speaker name or null","sd":0,
+"eq":"short=full or null",
+"q1":2,"q2":2,"q3":2}
+
+facts: each entry names ONE specific person/place/org/work and says what the sentence reports about it. Reuse names from [known: …] when they appear. Empty [] if no specific named subject.
+link: ONE main relation between two named things, or null. "how" is a short verb ("advises", "founded", "killed", "depends_on").
+judge: the author's evaluation of an entity or claim. null for most sentences.
+sp: who is speaking the sentence (a person name) or null for the narrator.
+sd: 0=narrator/exposition, 1=quoted speech, 2=quote-within-quote.
+eq: alias map if a short form in this sentence refers to a known full name (e.g. "Walz=Tim Walz"); else null.
 q1: 1=separating 2=connecting 3=producing
 q2: 1=existence 2=organization 3=meaning
 q3: 1=background 2=particular 3=pattern
-fn: 3-8 words describing what THIS sentence does
-sp: who is speaking (name or null if narrator)
-sd: 0=narrator 1=quoted speech 2=quote-within-quote
-eq: if a name in this sentence refers to a [known] entity, write "short=full" (e.g. "Walz=Tim Walz"). null otherwise.`;
+
+Example input sentence: "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
+Example output: {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}`;
 
   const allReadings = [];
   let corrections = 0, confirmations = 0, skipped = 0, errors = [];
@@ -2599,7 +2617,8 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
         const parts = key.split(' ');
         return parts.some(p => p.length >= 3 && clauseLower.includes(p));
       })
-      .slice(0, 3);
+      .sort(([,a], [,b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
+      .slice(0, 6);
     if(knownInClause.length > 0) {
       const hints = knownInClause.map(([key, ent]) => {
         const kind = (ent.claims||[]).find(c => c.rawType === 'kind');
@@ -2632,7 +2651,7 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
 
       const reply = await llmEngine.chat.completions.create({
         messages:[{role:'system',content:system},{role:'user',content:user}],
-        max_tokens: 80, temperature: 0.1,
+        max_tokens: 260, temperature: 0.1,
       });
       const raw = (reply.choices[0]?.message?.content || '').trim();
 
@@ -2640,15 +2659,95 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
       let parsedMode = null, parsedDomain = null, parsedObject = null;
       let parsedSpeaker = null, parsedSpeakerDepth = 0;
       let parsedSame = null, parsedLink = null;
+      let parsedFacts = [];        // [{e, says}]   — DEF events
+      let parsedRelations = [];    // [{from, to, how}] — CON events
+      let parsedJudgments = [];    // [{about, claim, holds}] — EVA events
+
+      // Tolerant JSON extractor — small models often produce nested
+      // objects and arrays, so a single {[^}]+} regex isn't enough.
+      // Walk braces to find the first balanced JSON object.
+      function extractBalancedJson(s) {
+        const start = s.indexOf('{');
+        if(start < 0) return null;
+        let depth = 0, inStr = false, esc = false;
+        for(let p = start; p < s.length; p++) {
+          const ch = s[p];
+          if(esc) { esc = false; continue; }
+          if(ch === '\\') { esc = true; continue; }
+          if(ch === '"') { inStr = !inStr; continue; }
+          if(inStr) continue;
+          if(ch === '{') depth++;
+          else if(ch === '}') { depth--; if(depth === 0) return s.slice(start, p + 1); }
+        }
+        return null;
+      }
 
       try {
-        let jsonStr = raw.replace(/```json\s*/g,'').replace(/```/g,'').trim();
-        const jsonMatch = jsonStr.match(/\{[^}]+\}/);
-        if(jsonMatch) {
-          const j = JSON.parse(jsonMatch[0]);
-          const q1 = (parseInt(j.q1||j.Q1||j['1']) || 1) - 1;
-          const q2 = (parseInt(j.q2||j.Q2||j['2']) || 1) - 1;
-          const q3 = (parseInt(j.q3||j.Q3||j['3']) || 1) - 1;
+        const cleaned = raw.replace(/```json\s*/g,'').replace(/```/g,'').trim();
+        const jsonStr = extractBalancedJson(cleaned) || cleaned.match(/\{[^}]+\}/)?.[0];
+        if(jsonStr) {
+          const j = JSON.parse(jsonStr);
+
+          // fn — the model's one-line reading of what the sentence does
+          if(j.fn) fn = stripPreamble(String(j.fn)).slice(0, 80);
+
+          // facts — DEF events: what is said about each named entity
+          if(Array.isArray(j.facts)) {
+            for(const f of j.facts) {
+              if(!f || typeof f !== 'object') continue;
+              const e = String(f.e || f.entity || f.about || '').trim();
+              const says = String(f.says || f.value || f.claim || '').trim();
+              if(e && says && e.length < 80 && says.length < 200) {
+                parsedFacts.push({ e, says });
+              }
+            }
+          }
+
+          // link — single CON event (small models do better with one)
+          const linkRaw = j.link || j.relation;
+          if(linkRaw && typeof linkRaw === 'object') {
+            const from = String(linkRaw.from || linkRaw.a || '').trim();
+            const to = String(linkRaw.to || linkRaw.b || '').trim();
+            const how = String(linkRaw.how || linkRaw.rel || linkRaw.type || 'related_to').trim();
+            if(from && to && from.toLowerCase() !== to.toLowerCase()) {
+              parsedRelations.push({ from, to, how: how.slice(0, 40) });
+              parsedLink = `${from} ${how} ${to}`;
+            }
+          }
+          if(Array.isArray(j.links)) {
+            for(const lk of j.links) {
+              if(!lk || typeof lk !== 'object') continue;
+              const from = String(lk.from || '').trim();
+              const to = String(lk.to || '').trim();
+              const how = String(lk.how || lk.rel || 'related_to').trim();
+              if(from && to && from.toLowerCase() !== to.toLowerCase()) {
+                parsedRelations.push({ from, to, how: how.slice(0, 40) });
+              }
+            }
+          }
+
+          // judge — EVA event: author's assessment
+          const judgeRaw = j.judge || j.judgment;
+          if(judgeRaw && typeof judgeRaw === 'object') {
+            const about = String(judgeRaw.about || judgeRaw.e || '').trim();
+            const claim = String(judgeRaw.claim || judgeRaw.says || '').trim();
+            const holds = (judgeRaw.holds === false || judgeRaw.status === 'fails') ? false : true;
+            if(about && claim) parsedJudgments.push({ about, claim: claim.slice(0, 200), holds });
+          }
+
+          // Speaker + alias passthrough (unchanged behaviour)
+          if(j.sp && String(j.sp).toLowerCase() !== 'null') parsedSpeaker = String(j.sp).slice(0, 40);
+          if(j.sd !== undefined && j.sd !== null) parsedSpeakerDepth = parseInt(j.sd) || 0;
+          if(j.eq && typeof j.eq === 'string' && j.eq.includes('=') && j.eq !== 'short=full' && j.eq.toLowerCase() !== 'null') {
+            parsedSame = j.eq;
+          }
+
+          // Classification axes — still parsed, but now secondary.
+          // If the model omitted them, derive op/site/stance from the
+          // reading content below.
+          const q1 = (parseInt(j.q1||j.Q1||j['1']) || 0) - 1;
+          const q2 = (parseInt(j.q2||j.Q2||j['2']) || 0) - 1;
+          const q3 = (parseInt(j.q3||j.Q3||j['3']) || 0) - 1;
           if(q1 >= 0 && q1 < 3 && q2 >= 0 && q2 < 3 && q3 >= 0 && q3 < 3) {
             const MK = Object.keys(MODES);
             const DK = Object.keys(DOMAINS);
@@ -2657,15 +2756,21 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
             parsedOp = OP_GRID[q1]?.[q2] || null;
             parsedSite = SITE_GRID[q2]?.[q3] || null;
             parsedStance = STANCE_GRID[q1]?.[q3] || null;
-            fn = j.fn ? stripPreamble(String(j.fn)).slice(0, 60) : null;
-            if(j.sp) parsedSpeaker = String(j.sp).slice(0, 40);
-            if(j.sd) parsedSpeakerDepth = parseInt(j.sd) || 0;
-            if(j.eq && typeof j.eq === 'string' && j.eq.includes('=') && j.eq !== 'short=full' && j.eq !== 'null') {
-              parsedSame = j.eq;
-            }
           }
         }
       } catch(e) {}
+
+      // Reading-derived op/site/stance — used when the model didn't
+      // hand back numeric axes but DID actually read the sentence.
+      if(!parsedOp) {
+        if(parsedJudgments.length > 0) {
+          parsedOp = 'EVA'; parsedSite = 'Lens'; parsedStance = 'Tracing';
+        } else if(parsedRelations.length > 0) {
+          parsedOp = 'CON'; parsedSite = 'Network'; parsedStance = 'Binding';
+        } else if(parsedFacts.length > 0) {
+          parsedOp = 'DEF'; parsedSite = 'Entity'; parsedStance = 'Clearing';
+        }
+      }
 
       if(!parsedOp) {
         const numMatch = raw.match(/([1-3])\s*[,.\s]\s*([1-3])\s*[,.\s]\s*([1-3])\s*\|(.+)/);
@@ -2711,10 +2816,11 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
         }
       }
 
-      if(fn) fn = fn.replace(/>>>/g,'').replace(/<<</g,'').replace(/\[describe the sentence\]/gi,'').replace(/^This specific sentence /i,'').trim().slice(0,60);
+      if(fn) fn = fn.replace(/>>>/g,'').replace(/<<</g,'').replace(/\[describe the sentence\]/gi,'').replace(/^This specific sentence /i,'').trim().slice(0,80);
       if(fn && fn.length < 3) fn = null;
 
-      if(!parsedOp && !fn) {
+      const hasReading = parsedFacts.length > 0 || parsedRelations.length > 0 || parsedJudgments.length > 0;
+      if(!parsedOp && !fn && !hasReading) {
         skipped++;
         errors.push({ clause: r.clauseIndex, error: 'unparseable: ' + raw.slice(0, 60) });
         prevClauseText = r.clause;
@@ -2723,13 +2829,32 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
 
       if(rawBuffer.length >= 5) {
         try {
-          const rawText = rawBuffer.join('\n');
+          // Build the hypothesis input from what was READ, not from raw
+          // clause text. This mirrors the original eoReader hierarchy:
+          // entity hypotheses → group hypothesis → section hypothesis.
+          // Falls back to raw clauses if the LLM didn't extract anything.
+          const recentReadings = allReadings.slice(-5);
+          const factLines = [];
+          for(const ar of recentReadings) {
+            if(ar.fn) factLines.push('· ' + ar.fn);
+            for(const f of (ar.reading?.facts || []).slice(0, 2)) {
+              factLines.push(`  - ${f.e}: ${f.says}`);
+            }
+            for(const rel of (ar.reading?.relations || []).slice(0, 1)) {
+              factLines.push(`  → ${rel.from} ${rel.how} ${rel.to}`);
+            }
+          }
+          const distilled = factLines.length > 0 ? factLines.join('\n') : rawBuffer.join('\n');
+
           const paraPrompt = paraHyp
-            ? `Current understanding:\n"${paraHyp}"\n\nNew text:\n${rawText}\n\nRevise your understanding into one sentence. Keep what still holds. Add what's new. Drop what was corrected.`
-            : `${rawText}\n\nWhat has this text established so far? One sentence. Under 20 words.`;
+            ? `What this passage has established so far:\n"${paraHyp}"\n\nNew readings:\n${distilled}\n\nRevise into ONE sentence (under 25 words). Keep what still holds. Add what's new. Be specific — name the actors and what they did or said.`
+            : `Readings from the passage:\n${distilled}\n\nWrite ONE sentence (under 25 words) for what this passage is about. Be specific — name the actors and what they did or said. No filler.`;
           const hypReply = await llmEngine.chat.completions.create({
-            messages:[{role:'user', content: paraPrompt}],
-            max_tokens: 40, temperature: 0.1,
+            messages:[
+              {role:'system', content:'You write one specific, grounded sentence. No preamble.'},
+              {role:'user', content: paraPrompt},
+            ],
+            max_tokens: 60, temperature: 0.1,
           });
           paraHyp = stripPreamble((hypReply.choices[0]?.message?.content || '').trim());
         } catch(e) { /* hypothesis call failed, continue without it */ }
@@ -2790,6 +2915,13 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
         readOp: newOp, readSite: newSite, readStance: newStance,
         fn, same: parsedSame, readLink: parsedLink,
         hyp: paraHyp,
+        // The structured reading the model produced for this clause.
+        // facts → DEFs; relations → CONs; judgments → EVAs.
+        reading: {
+          facts: parsedFacts,
+          relations: parsedRelations,
+          judgments: parsedJudgments,
+        },
         speaker: { name: finalSpeaker, depth: finalDepth, type: finalType, via: r.quoteState?.detectedVia },
         reclassified: readingType === 'corrected',
         confirmed: readingType === 'confirmed',
@@ -2831,6 +2963,126 @@ eq: if a name in this sentence refers to a [known] entity, write "short=full" (e
           });
           graph.entities[lk].mentions.push(r.clauseIndex);
         }
+
+      // ── Write LLM reading into the graph ──────────────────────
+      // Resolve a free-form name from the model to a canonical entity key.
+      // Prefers an existing entity (substring or last-token match), else
+      // returns the lowercased name and lazily SIGs a new entity below.
+      const resolveReadName = (name) => {
+        const lower = String(name || '').toLowerCase().trim();
+        if(!lower) return null;
+        if(graph.entities[lower]) return lower;
+        for(const [k, e] of Object.entries(graph.entities)) {
+          const last = k.split(/\s+/).pop();
+          if(last === lower) return k;
+          if(k.startsWith(lower + ' ') || k.endsWith(' ' + lower)) return k;
+        }
+        return lower;
+      };
+      const ensureReadEntity = (name, terrain) => {
+        const key = resolveReadName(name);
+        if(!key) return null;
+        if(!graph.entities[key]) {
+          graph.entities[key] = {
+            name: name, terrain: terrain || 'Entity',
+            claims: [], edges: [], mentions: [], ledgers: {},
+            stage: 'read', viaLLM: true,
+          };
+          emit('INS', terrain || 'Entity', 'Clearing', name, 'llm-read', r.clauseIndex);
+        }
+        return key;
+      };
+
+      const readSpeaker = { name: finalSpeaker, depth: finalDepth, type: finalType, via: r.quoteState?.detectedVia };
+      const newClaimsAdded = [];
+
+      // facts → DEF claims (one per fact). Skip exact duplicates.
+      for(const f of parsedFacts) {
+        const key = ensureReadEntity(f.e, 'Entity');
+        if(!key) continue;
+        const ent = graph.entities[key];
+        const dupe = (ent.claims || []).some(c =>
+          c.clauseIndex === r.clauseIndex && c.value === f.says && c.rawType === 'def-llm'
+        );
+        if(dupe) continue;
+        const claim = {
+          entity: ent.name, value: f.says, span: r.clause,
+          rawType: 'def-llm',
+          operator: 'DEF', site: 'Entity', resolution: 'Clearing',
+          notation: 'DEF(Entity,Clearing)',
+          clauseIndex: r.clauseIndex, fn,
+          speaker: readSpeaker,
+          provenance: 'llm-read',
+        };
+        ent.claims.push(claim);
+        ent.mentions.push(r.clauseIndex);
+        graph.claims.push(claim);
+        newClaimsAdded.push(claim);
+        emit('DEF', 'Entity', 'Clearing', ent.name, f.says.slice(0, 80), r.clauseIndex);
+      }
+
+      // link / links → CON events + graph.bindings entries
+      for(const rel of parsedRelations) {
+        const fromKey = ensureReadEntity(rel.from, 'Entity');
+        const toKey = ensureReadEntity(rel.to, 'Entity');
+        if(!fromKey || !toKey || fromKey === toKey) continue;
+        const fromEnt = graph.entities[fromKey];
+        const toEnt = graph.entities[toKey];
+        const dupeEdge = (fromEnt.edges || []).some(e =>
+          e.to === toEnt.name && e.relation === rel.how && e.clauseIndex === r.clauseIndex
+        );
+        if(!dupeEdge) {
+          fromEnt.edges = fromEnt.edges || [];
+          fromEnt.edges.push({
+            from: fromEnt.name, to: toEnt.name, relation: rel.how,
+            clauseIndex: r.clauseIndex, span: r.clause, provenance: 'llm-read',
+          });
+        }
+        const binding = {
+          subject: fromEnt.name, predicate: rel.how, object: toEnt.name,
+          clauseIndex: r.clauseIndex, span: r.clause,
+          speaker: readSpeaker, provenance: 'llm-read',
+        };
+        graph.bindings = graph.bindings || [];
+        const dupeBind = graph.bindings.some(b =>
+          b.subject === binding.subject && b.predicate === binding.predicate &&
+          b.object === binding.object && b.clauseIndex === binding.clauseIndex
+        );
+        if(!dupeBind) graph.bindings.push(binding);
+        emit('CON', 'Network', 'Binding', fromEnt.name, `${rel.how}→${toEnt.name}`, r.clauseIndex);
+      }
+
+      // judge → EVA claim against the named entity
+      for(const jdg of parsedJudgments) {
+        const key = ensureReadEntity(jdg.about, 'Lens');
+        if(!key) continue;
+        const ent = graph.entities[key];
+        const claim = {
+          entity: ent.name, value: jdg.claim, span: r.clause,
+          rawType: 'eva-llm',
+          operator: 'EVA', site: 'Lens', resolution: 'Tracing',
+          notation: 'EVA(Lens,Tracing)',
+          clauseIndex: r.clauseIndex, fn,
+          status: jdg.holds ? 'holds' : 'fails',
+          speaker: readSpeaker,
+          provenance: 'llm-read',
+        };
+        ent.claims.push(claim);
+        ent.mentions.push(r.clauseIndex);
+        graph.claims.push(claim);
+        emit('EVA', 'Lens', 'Tracing', ent.name,
+          `${jdg.holds ? '✓' : '✗'} ${jdg.claim.slice(0, 60)}`, r.clauseIndex);
+      }
+
+      // Stash the reading on the clause result so renderReadings + the
+      // chat horizon can show what the model actually read, not just
+      // an op/site/stance tag.
+      r.reading = {
+        fn,
+        facts: parsedFacts,
+        relations: parsedRelations,
+        judgments: parsedJudgments,
+      };
 
       prevClauseText = r.clause;
 
@@ -3442,7 +3694,8 @@ function renderReadings(){
   }
 
   const showAll = readings.length < 60;
-  const toShow = showAll ? readings : readings.filter(r => r.reclassified || r.fallback || r.same || r.readLink || r.fn || r.hyp);
+  const hasReadingContent = (r) => r.reading && ((r.reading.facts||[]).length || (r.reading.relations||[]).length || (r.reading.judgments||[]).length);
+  const toShow = showAll ? readings : readings.filter(r => r.reclassified || r.fallback || r.same || r.readLink || r.fn || r.hyp || hasReadingContent(r));
 
   let lastHyp = '';
   for(const r of toShow){
@@ -3470,6 +3723,25 @@ function renderReadings(){
     if(r.same) html+=`<span class="tag" style="background:rgba(92,224,160,0.1);color:var(--green)">≡ ${r.same}</span>`;
     if(r.fn) html+=`<span class="tag-fn">${esc(r.fn)}</span>`;
     html+=`</div>`;
+
+    // The actual reading: what the model said this clause was about.
+    const rd = r.reading;
+    const hasRead = rd && ((rd.facts && rd.facts.length) || (rd.relations && rd.relations.length) || (rd.judgments && rd.judgments.length));
+    if(hasRead) {
+      html+=`<div class="reading-detail" style="margin:4px 0 6px 0;padding:4px 8px;border-left:2px solid var(--accent);background:rgba(111,163,247,0.04);font-size:11px;line-height:1.5">`;
+      for(const f of (rd.facts || []).slice(0, 4)) {
+        html+=`<div style="color:var(--text)"><span style="color:var(--green)">${esc(f.e)}</span> <span style="color:var(--dim)">→</span> ${esc(f.says)}</div>`;
+      }
+      for(const rel of (rd.relations || []).slice(0, 2)) {
+        html+=`<div style="color:var(--accent)">${esc(rel.from)} <span style="opacity:0.7">[${esc(rel.how)}]</span> ${esc(rel.to)}</div>`;
+      }
+      for(const jdg of (rd.judgments || []).slice(0, 2)) {
+        const mark = jdg.holds ? '✓' : '✗';
+        const col = jdg.holds ? 'var(--green)' : 'var(--red)';
+        html+=`<div style="color:${col}">${mark} <span style="color:var(--text)">${esc(jdg.about)}:</span> ${esc(jdg.claim)}</div>`;
+      }
+      html+=`</div>`;
+    }
     if(hypChanged) {
       const prevWords = new Set(lastHyp.toLowerCase().split(/\s+/));
       const newWords = new Set(r.hyp.toLowerCase().split(/\s+/));

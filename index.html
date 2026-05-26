@@ -1878,19 +1878,30 @@ async function processText(text) {
     const structuralAbsence = !hasEntities && !hasPropositions && sal < 0.10;
 
     if(structuralAbsence) {
+      // The mechanical extractor found no entities and no propositions
+      // here, but that often means the extractor's regex missed real
+      // content (em-dashes, parentheticals, weird punctuation). Don't
+      // bury the clause as chrome — tag it as "missed" and let the LLM
+      // read it. The user-visible rule: every non-pattern-chrome clause
+      // gets a chance to be encoded.
       const chromeHash = clause.trim().toLowerCase().replace(/\s+/g,' ').slice(0,50);
-      emit('SEG', 'Void', 'Clearing', `c${i+1}`, 'chrome:structural', i);
-      allResults.push({clauseIndex:i,clause,entity:'(chrome)',value:'',span:clause,
-        rawType:'chrome',salience:sal,chromeReason:'structural',chromeHash,quoteState,
+      emit('SIG', 'Void', 'Clearing', `c${i+1}`, 'mech-missed', i);
+      allResults.push({clauseIndex:i,clause,entity:'(missed)',value:'',span:clause,
+        rawType:'missed',salience:sal,chromeReason:'structural',chromeHash,quoteState,
         operator:{name:'—'},terrain:{name:'—'},stance:{name:'—'},frameEvents:[],claims:[]});
-      graph.clauses.push({index:i,text:clause,salience:sal,terrain:'Void',stage:'extracted',skip:true});
+      graph.clauses.push({index:i,text:clause,salience:sal,terrain:'Void',stage:'mech-missed'});
       continue;
     }
 
     if(sal < 0.12){
+      // Inert by salience — still encoded, still gets sent to the LLM
+      // for a real read. The salience number is the embedding's guess
+      // at importance; short critical sentences ("He ended his run as
+      // host of The Late Show on Thursday") score low but are the
+      // story. Keep them in the read pool.
       allResults.push({clauseIndex:i,clause,entity:'(inert)',value:'',span:clause,rawType:'inert',salience:sal,
         operator:{name:'—'},terrain:{name:'—'},stance:{name:'—'},frameEvents:[],claims:[]});
-      graph.clauses.push({index:i,text:clause,salience:sal,terrain:'Void',stage:'extracted',skip:true});
+      graph.clauses.push({index:i,text:clause,salience:sal,terrain:'Void',stage:'inert'});
       continue;
     }
 
@@ -2501,62 +2512,96 @@ async function startReading(){
   // (facts → DEF, links → CON, judges → EVA) — no separate axis
   // classification, which a small model would just echo verbatim
   // from any example given.
-  const system=`You read ONE sentence and report ONLY what it literally says. When in doubt, leave fields empty or null. Most sentences have NO link and NO judge.
+  // Per-clause READ prompt. Adapted from the original eoReader walk
+  // prompt (see processAndAccept in eoReader/js/walk.js) — the model
+  // emits a list of typed EO events for the sentence. Multiple of any
+  // kind are allowed and expected: every site introduced, every
+  // definition added, every connection drawn, every author judgment
+  // becomes an event. Sites include nominalized EVENTS (e.g. "the
+  // cancellation", "the merger", "his final show") — these are
+  // first-class kinds with their own working hypotheses, not just
+  // facts about a person.
+  const system=`You read ONE sentence and emit the EO events it produces. Every site introduced, every relation drawn, every claim or judgment becomes a typed event.
 
 Reply with ONLY a JSON object (no prose, no markdown, no code fence):
 {"fn":"verb-phrase: what THIS sentence does (4-10 words)",
-"facts":[{"e":"name","says":"what the sentence states","quote":"<5-25 words copied verbatim from the sentence proving this fact>"}],
-"link":null,
-"judge":null,
+"events":[ … ],
 "sp":null,"sd":0,
 "eq":null}
 
-GROUNDING — the most important rule:
-- Every fact MUST include a "quote" — a 5-25 word verbatim substring copied from the sentence below that proves the fact.
-- If you cannot find a verbatim span in the sentence that proves a fact, OMIT THE FACT.
-- Do NOT paraphrase the priors into facts. facts.says reports what THIS sentence says, with a verbatim quote from this sentence.
+EVENT TYPES — emit as many as the sentence supports:
 
-DEFAULTS — null and empty are the right answers most of the time:
-- link is null for ~80% of sentences. Only include link when the sentence has a clear "X verbed Y" predicate, where the verb is literally in the sentence, and both X and Y are named in the sentence.
-  - "X said …", "X reported …", "X wrote …" → link is null. These are reporting verbs, not relations.
-  - "X is mentioned in the same paragraph as Y" → link is null. Not a relation.
-  - "X founded Y", "X advises Z", "X cited Y" → these ARE links.
-- judge is null for ~95% of sentences. Only include judge when the AUTHOR (not a quoted person) is evaluating an entity or claim.
-- facts is [] when the sentence is boilerplate, a header, a navigation crumb, a quote fragment, or makes no specific claim about a named entity.
+{"op":"SIG","site":"<name>","kind":"person|place|org|work|event|concept","quote":"<verbatim>"}
+  Introduces a site to the graph. "kind":"event" is for nominalized happenings — "the cancellation", "the merger", "his appearance", "the parody". These are first-class sites with their own histories, not facts about a person. Use SIG for any name new to this clause.
+
+{"op":"DEF","site":"<name>","says":"<what the sentence says about it>","quote":"<verbatim>"}
+  Adds a definition / attribute / action to an existing or just-SIG'd site. For event sites: when, why, how, who was involved, what followed. For people: role, action, attribute. Multiple DEFs per site per clause are normal.
+
+{"op":"CON","from":"<site A>","to":"<site B>","how":"<short verb>","quote":"<verbatim>"}
+  Connects two sites with a relation. The verb must be IN the sentence. Multiple CONs per clause are normal. Events can connect to people (cancellation → CBS, "decided") and to other events (cancellation → merger, "came as").
+  "X said Y", "X wrote …", "X reported …" — reporting verbs are NOT relations. Do not emit CON for them.
+
+{"op":"EVA","site":"<name>","claim":"<what is judged>","holds":true,"quote":"<verbatim>"}
+  Author's evaluation of a site or claim. Most sentences emit no EVA.
+
+{"op":"REC","site":"<name>","reason":"<why>","quote":"<verbatim>"}
+  Recast: the sentence reframes a site (different role, different kind of thing than the priors). Use sparingly.
+
+GROUNDING — the rule everything else hangs on:
+- Every event MUST include a "quote" — a 5-25 word verbatim substring copied from the sentence below that proves the event.
+- If you cannot find a verbatim span supporting an event, OMIT THE EVENT.
+- Do NOT copy text from the priors into events.says. events.says reports what THIS sentence actually says, with a verbatim quote from this sentence.
 
 HOW TO READ THE USER MESSAGE:
-- The bracketed blocks are PRIORS — for ORIENTATION ONLY. They tell you which names are in scope and what's been said about them so far. They are NOT to be copied into your output.
-- [passage so far: …] — rolling working hypothesis for the passage
+- The bracketed blocks are PRIORS — for orientation. They tell you which names and event-sites are in scope.
+- [passage so far: …] — rolling passage hypothesis
 - [named in this clause …] — sites named in THIS sentence with their current working hypothesis
-- [carried forward …] — sites in scope from the last few clauses; pick from these when this sentence has a pronoun ("he", "she", "they", "it")
+- [carried forward …] — sites in scope from recent clauses; pick from these when this sentence has a pronoun
 - [fast-prior …] — the mechanical extractor's cheap guess for this clause
 
 CRITICAL RULES:
-- Stay inside THIS sentence. Do NOT copy text from priors into facts.says or invent facts to match a prior. The "quote" field forces this: if there's no verbatim span in the sentence, no fact.
-- "I", "me", "my", "we", "us" refer to the NARRATOR. Not a named entity. If the subject is "I" with no named co-actor, set facts:[].
-- Attribute actions to the entity actually DOING them. "I asked X about Y" → narrator asked, X was asked, Y is the topic. Do NOT make Y the asker just because Y is mentioned.
-- Resolve pronouns using [carried forward …] only when there is a clear antecedent. If unclear, omit.
-- fn is a description, not a tag. "reports the Mayor's announcement" ✓ — "Bill Lee" ✗.
+- Events as sites: when the sentence mentions "the cancellation", "the appearance", "the merger", "his final show", "the parody", "the discussion" — SIG these as kind:"event" and DEF what the sentence says about them.
+- Stay inside THIS sentence. The "quote" field forces this — no verbatim, no event.
+- "I", "me", "my", "we", "us" refer to the NARRATOR. Not a site.
+- Attribute actions to the actor. "I asked X about Y" → narrator asked, X was asked, Y is the topic.
+- Reporting verbs ("said", "wrote", "reported") never produce a CON event.
+- events:[] when the sentence is boilerplate / a fragment / says nothing extractable.
 
-EXAMPLES — most have null link, null judge:
+EXAMPLES:
 
-1) "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
-→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019","quote":"Smith, who left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy","quote":"now advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null}
+1) "CBS canceled Colbert's top-rated late-night show in July 2025, describing the move as a financial decision."
+→ {"fn":"reports CBS's cancellation of the Late Show","events":[
+{"op":"SIG","site":"the cancellation","kind":"event","quote":"CBS canceled Colbert's top-rated late-night show in July 2025"},
+{"op":"DEF","site":"the cancellation","says":"announced by CBS in July 2025","quote":"CBS canceled Colbert's top-rated late-night show in July 2025"},
+{"op":"DEF","site":"the cancellation","says":"CBS described it as a financial decision","quote":"describing the move as a financial decision"},
+{"op":"CON","from":"CBS","to":"Stephen Colbert","how":"canceled","quote":"CBS canceled Colbert's top-rated late-night show"}],
+"sp":null,"sd":0,"eq":null}
 
-2) "\"Not everybody's gonna love me,\" Allen said."
-→ {"fn":"quotes Allen on not being universally liked","facts":[{"e":"Allen","says":"said not everybody will love him","quote":"\"Not everybody's gonna love me,\" Allen said"}],"link":null,"judge":null,"sp":"Allen","sd":1,"eq":null}
+2) "But the cancellation also came as Paramount Global – which owns CBS – sought the Trump administration's approval for its $8.4 billion merger with Skydance Media."
+→ {"fn":"sets the cancellation in the merger-approval context","events":[
+{"op":"SIG","site":"the merger","kind":"event","quote":"$8.4 billion merger with Skydance Media"},
+{"op":"DEF","site":"the merger","says":"$8.4 billion Paramount Global / Skydance Media merger","quote":"$8.4 billion merger with Skydance Media"},
+{"op":"DEF","site":"the merger","says":"required Trump administration approval","quote":"sought the Trump administration's approval"},
+{"op":"DEF","site":"the cancellation","says":"came as Paramount sought Trump-admin approval for the merger","quote":"the cancellation also came as Paramount Global … sought the Trump administration's approval"},
+{"op":"CON","from":"Paramount Global","to":"CBS","how":"owns","quote":"Paramount Global – which owns CBS"},
+{"op":"CON","from":"the cancellation","to":"the merger","how":"came_as","quote":"the cancellation also came as Paramount Global … sought the Trump administration's approval for its $8.4 billion merger"}],
+"sp":null,"sd":0,"eq":null}
 
-3) "In fact, his final show aired on Thursday, May 21, 2026."
-→ {"fn":"states the date of the final show","facts":[],"link":null,"judge":null,"sp":null,"sd":0,"eq":null}
-(facts is empty — "his" is a pronoun with no clear named referent in this sentence; the date is not about a named site.)
+3) "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
+→ {"fn":"reports Smith's career move and current advisory role","events":[
+{"op":"DEF","site":"Smith","says":"left Boeing in 2019","quote":"left Boeing in 2019"},
+{"op":"DEF","site":"Smith","says":"advises the Pentagon on drone policy","quote":"advises the Pentagon on drone policy"},
+{"op":"CON","from":"Smith","to":"Boeing","how":"left","quote":"Smith, who left Boeing in 2019"},
+{"op":"CON","from":"Smith","to":"Pentagon","how":"advises","quote":"advises the Pentagon on drone policy"}],
+"sp":null,"sd":0,"eq":null}
 
-4) "In a statement to NPR on Monday, CBS said that Colbert's 'Only In Monroe' episode was 'financed and produced by CBS studios'."
-→ {"fn":"CBS attributes the parody to CBS studios","facts":[{"e":"CBS","says":"called Colbert's Only In Monroe episode financed and produced by CBS studios","quote":"CBS said that Colbert's \"Only In Monroe\" episode was \"financed and produced by CBS studios\""},{"e":"Only In Monroe","says":"was financed and produced by CBS studios","quote":"\"financed and produced by CBS studios\""}],"link":null,"judge":null,"sp":"CBS","sd":1,"eq":null}
-(link is null — "X said Y" is a reporting verb, not a relation.)
+4) "\"Not everybody's gonna love me,\" Allen said."
+→ {"fn":"quotes Allen on not being universally liked","events":[
+{"op":"DEF","site":"Allen","says":"said not everybody will love him","quote":"\"Not everybody's gonna love me,\" Allen said"}],
+"sp":"Allen","sd":1,"eq":null}
 
 5) "Evan Agostini/Evan Agostini/Invision/AP/Invision hide caption toggle caption"
-→ {"fn":"image caption credit boilerplate","facts":[],"link":null,"judge":null,"sp":null,"sd":0,"eq":null}
-(boilerplate fragment — output empty.)`;
+→ {"fn":"image-caption boilerplate","events":[],"sp":null,"sd":0,"eq":null}`;
 
   const allReadings = [];
   let corrections = 0, confirmations = 0, skipped = 0, errors = [];
@@ -2932,9 +2977,11 @@ When there is no prior, use "refine".` },
       let parsedOp = null, parsedSite = null, parsedStance = null, fn = null;
       let parsedSpeaker = null, parsedSpeakerDepth = 0;
       let parsedSame = null, parsedLink = null;
-      let parsedFacts = [];        // [{e, says}]   — DEF events
-      let parsedRelations = [];    // [{from, to, how}] — CON events
-      let parsedJudgments = [];    // [{about, claim, holds}] — EVA events
+      let parsedFacts = [];        // [{e, says, quote}]   — DEF events
+      let parsedRelations = [];    // [{from, to, how, quote}] — CON events
+      let parsedJudgments = [];    // [{about, claim, holds, quote}] — EVA events
+      let parsedSiteKinds = new Map(); // name(lower) → "event"|"work"|… from SIG events
+      let parsedRecasts = [];      // [{site, reason}] — REC events
 
       try {
         const cleaned = raw.replace(/```json\s*/g,'').replace(/```/g,'').trim();
@@ -2981,7 +3028,74 @@ When there is no prior, use "refine".` },
             return false;
           };
 
-          // facts — DEF events: what is said about each named entity
+          // CON-relation guard: the verb must appear in the clause and
+          // can't be a reporting verb. Hoisted above both events[] and
+          // facts/link parsing so both paths can use it.
+          const verbInClause = (verb) => {
+            const v = String(verb || '').toLowerCase().trim();
+            if(!v) return false;
+            if(/^(said|says|reported|reports|wrote|writes|notes|noted|stated|states|told|tells|asked|adds|added|mentioned)$/i.test(v)) return false;
+            const stem = v.replace(/(ed|ing|s)$/, '');
+            return stem.length >= 3 && clauseNorm.includes(stem);
+          };
+
+          // events[] — the typed EO event stream from the model (the
+          // shape used by the original eoReader walk). Multiple
+          // SIG/DEF/CON/EVA/REC events per clause are normal. Sites
+          // with kind:"event" are nominalized happenings and become
+          // first-class sites in the graph just like people.
+          const EVENT_KINDS = new Set(['person','place','org','organization','work','event','concept']);
+          const REL_TYPES = new Set(['SIG','DEF','CON','EVA','REC','SEG']);
+          if(Array.isArray(j.events)) {
+            for(const ev of j.events) {
+              if(!ev || typeof ev !== 'object') continue;
+              const op = String(ev.op || '').toUpperCase().trim();
+              if(!REL_TYPES.has(op)) continue;
+              const quote = String(ev.quote || ev.span || '').trim();
+
+              if(op === 'SIG') {
+                const site = String(ev.site || ev.id || ev.name || ev.canonical || '').trim();
+                if(!acceptReadName(site)) continue;
+                if(!grounded(quote, site)) continue;
+                const rawKind = String(ev.kind || ev.subtype || '').toLowerCase().trim();
+                const kind = EVENT_KINDS.has(rawKind) ? (rawKind === 'organization' ? 'org' : rawKind) : '';
+                if(kind) parsedSiteKinds.set(site.toLowerCase(), kind);
+              } else if(op === 'DEF') {
+                const site = String(ev.site || ev.id || ev.entity || ev.about || '').trim();
+                const says = String(ev.says || ev.hypothesis || ev.value || ev.claim || '').trim();
+                if(!acceptReadName(site) || !says || says.length >= 280) continue;
+                if(!grounded(quote, says)) continue;
+                parsedFacts.push({ e: site, says, quote });
+              } else if(op === 'CON') {
+                const from = String(ev.from || ev.a || '').trim();
+                const to = String(ev.to || ev.b || '').trim();
+                const how = String(ev.how || ev.relation || ev.rel || '').trim();
+                if(!acceptReadName(from) || !acceptReadName(to)) continue;
+                if(from.toLowerCase() === to.toLowerCase()) continue;
+                if(!verbInClause(how)) continue;
+                if(!grounded(quote, how + ' ' + from + ' ' + to)) continue;
+                parsedRelations.push({ from, to, how: how.slice(0, 40), quote });
+              } else if(op === 'EVA') {
+                const about = String(ev.site || ev.id || ev.about || '').trim();
+                const claim = String(ev.claim || ev.note || ev.says || '').trim();
+                const holds = (ev.holds === false || ev.verdict === 'fails' || ev.status === 'fails') ? false : true;
+                if(!acceptReadName(about) || !claim) continue;
+                if(!grounded(quote, claim)) continue;
+                parsedJudgments.push({ about, claim: claim.slice(0, 280), holds, quote });
+              } else if(op === 'REC') {
+                const site = String(ev.site || ev.id || '').trim();
+                const reason = String(ev.reason || ev.note || '').trim();
+                if(!acceptReadName(site)) continue;
+                if(!grounded(quote, site + ' ' + reason)) continue;
+                parsedRecasts.push({ site, reason, quote });
+              }
+              // SEG ignored at this layer — hypothesis revision handles
+              // splits via the "recast" move.
+            }
+          }
+
+          // facts — legacy shape, parsed when the model returned the
+          // older {facts, link, judge} schema instead of {events}.
           if(Array.isArray(j.facts)) {
             for(const f of j.facts) {
               if(!f || typeof f !== 'object') continue;
@@ -2994,19 +3108,6 @@ When there is no prior, use "refine".` },
               parsedFacts.push({ e, says, quote });
             }
           }
-
-          // link / links — CON events. Same grounding rule: the verb
-          // ("how") should appear in the clause, otherwise it's the model
-          // fabricating a relation to satisfy the schema.
-          const verbInClause = (verb) => {
-            const v = String(verb || '').toLowerCase().trim();
-            if(!v) return false;
-            // Reject reporting verbs that are usually NOT relations.
-            if(/^(said|says|reported|reports|wrote|writes|notes|noted|stated|states|told|tells|asked|adds|added|mentioned)$/i.test(v)) return false;
-            // Look for the verb stem in the clause.
-            const stem = v.replace(/(ed|ing|s)$/, '');
-            return stem.length >= 3 && clauseNorm.includes(stem);
-          };
 
           const linkRaw = j.link || j.relation;
           if(linkRaw && typeof linkRaw === 'object') {
@@ -3226,24 +3327,47 @@ When there is no prior, use "refine".` },
         }
         return lower;
       };
+      // Map a model-declared SIG kind onto an EO terrain. Events
+      // ("the cancellation", "the merger") land on Network — that's
+      // where causal/temporal happenings live in EO. Concept/Lens
+      // nominals land on Lens. People/places/orgs/works default to
+      // Entity. The kind itself is preserved on the entity so the
+      // hypothesis revision can use it as context.
+      const KIND_TO_TERRAIN = {
+        event: 'Network',
+        concept: 'Lens',
+        work: 'Entity',
+        org: 'Entity',
+        person: 'Entity',
+        place: 'Entity',
+      };
+
       const ensureReadEntity = (name, terrain) => {
         const key = resolveReadName(name);
         if(!key) return null;
+        const sigKind = parsedSiteKinds.get(String(name || '').toLowerCase()) ||
+          parsedSiteKinds.get(key) || null;
+        const effTerrain = terrain || (sigKind ? KIND_TO_TERRAIN[sigKind] : 'Entity') || 'Entity';
         if(!graph.entities[key]) {
           graph.entities[key] = {
-            name: name, terrain: terrain || 'Entity',
+            name: name, terrain: effTerrain,
+            kind: sigKind || null,
             claims: [], edges: [], mentions: [], ledgers: {},
             stage: 'read', viaLLM: true,
             eoLog: [{
-              op: 'INS', site: terrain || 'Entity', stance: 'Clearing',
+              op: 'INS', site: effTerrain, stance: 'Clearing',
               ts: new Date().toISOString(),
               clauseIndex: r.clauseIndex,
-              value: 'site introduced from llm-read',
+              value: sigKind ? `site introduced as ${sigKind}` : 'site introduced from llm-read',
               span: r.clause.slice(0, 200),
               provenance: 'llm-read',
+              kind: sigKind || null,
             }],
           };
-          emit('INS', terrain || 'Entity', 'Clearing', name, 'llm-read', r.clauseIndex);
+          emit('INS', effTerrain, 'Clearing', name,
+            sigKind ? `llm-read:${sigKind}` : 'llm-read', r.clauseIndex);
+        } else if(sigKind && !graph.entities[key].kind) {
+          graph.entities[key].kind = sigKind;
         }
         return key;
       };
@@ -3251,9 +3375,30 @@ When there is no prior, use "refine".` },
       const readSpeaker = { name: finalSpeaker, depth: finalDepth, type: finalType, via: r.quoteState?.detectedVia };
       const newClaimsAdded = [];
 
+      // SIG events first: create any sites the model introduced (incl.
+      // event-kind sites like "the cancellation"). Without this, a bare
+      // SIG with no accompanying DEF would be lost.
+      for(const [siteLow, sigKind] of parsedSiteKinds) {
+        const display = (parsedFacts.find(f => f.e.toLowerCase() === siteLow)?.e)
+          || (parsedRelations.find(r2 => r2.from.toLowerCase() === siteLow)?.from)
+          || (parsedRelations.find(r2 => r2.to.toLowerCase() === siteLow)?.to)
+          || siteLow;
+        ensureReadEntity(display, KIND_TO_TERRAIN[sigKind] || 'Entity');
+      }
+
+      // REC events: hypothesis revision will recast these sites at the
+      // next entity-hypothesis pass. Mark them so the revision uses the
+      // "recast" move with the reason the sentence gave.
+      for(const rec of parsedRecasts) {
+        const key = ensureReadEntity(rec.site, 'Entity');
+        if(!key) continue;
+        const ent = graph.entities[key];
+        ent._pendingRecast = { reason: rec.reason, clauseIndex: r.clauseIndex, quote: rec.quote };
+      }
+
       // facts → DEF claims (one per fact). Skip exact duplicates.
       for(const f of parsedFacts) {
-        const key = ensureReadEntity(f.e, 'Entity');
+        const key = ensureReadEntity(f.e, null);
         if(!key) continue;
         const ent = graph.entities[key];
         const dupe = (ent.claims || []).some(c =>
@@ -3286,8 +3431,8 @@ When there is no prior, use "refine".` },
 
       // link / links → CON events + graph.bindings entries
       for(const rel of parsedRelations) {
-        const fromKey = ensureReadEntity(rel.from, 'Entity');
-        const toKey = ensureReadEntity(rel.to, 'Entity');
+        const fromKey = ensureReadEntity(rel.from, null);
+        const toKey = ensureReadEntity(rel.to, null);
         if(!fromKey || !toKey || fromKey === toKey) continue;
         const fromEnt = graph.entities[fromKey];
         const toEnt = graph.entities[toKey];
@@ -3330,7 +3475,7 @@ When there is no prior, use "refine".` },
 
       // judge → EVA claim against the named entity
       for(const jdg of parsedJudgments) {
-        const key = ensureReadEntity(jdg.about, 'Lens');
+        const key = ensureReadEntity(jdg.about, null);
         if(!key) continue;
         const ent = graph.entities[key];
         const claim = {

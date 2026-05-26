@@ -2538,7 +2538,7 @@ EVENT TYPES — emit as many as the sentence supports:
   Adds a definition / attribute / action to an existing or just-SIG'd site. For event sites: when, why, how, who was involved, what followed. For people: role, action, attribute. Multiple DEFs per site per clause are normal.
 
 {"op":"CON","from":"<site A>","to":"<site B>","how":"<short verb>","quote":"<verbatim>"}
-  Connects two sites with a relation. The verb must be IN the sentence. Multiple CONs per clause are normal. Events can connect to people (cancellation → CBS, "decided") and to other events (cancellation → merger, "came as").
+  Connects two sites with a relation. The verb must be ONE WORD and must literally appear in the sentence (e.g. "owns", "founded", "advises", "killed", "merging", "came"). No underscores, no multi-word phrases like "came_as" or "linked_to" — those will be rejected. Multiple CONs per clause are normal. Events can connect to people (cancellation → CBS, "canceled") and to other events (cancellation → merger, "came").
   "X said Y", "X wrote …", "X reported …" — reporting verbs are NOT relations. Do not emit CON for them.
 
 {"op":"EVA","site":"<name>","claim":"<what is judged>","holds":true,"quote":"<verbatim>"}
@@ -2584,7 +2584,7 @@ EXAMPLES:
 {"op":"DEF","site":"the merger","says":"required Trump administration approval","quote":"sought the Trump administration's approval"},
 {"op":"DEF","site":"the cancellation","says":"came as Paramount sought Trump-admin approval for the merger","quote":"the cancellation also came as Paramount Global … sought the Trump administration's approval"},
 {"op":"CON","from":"Paramount Global","to":"CBS","how":"owns","quote":"Paramount Global – which owns CBS"},
-{"op":"CON","from":"the cancellation","to":"the merger","how":"came_as","quote":"the cancellation also came as Paramount Global … sought the Trump administration's approval for its $8.4 billion merger"}],
+{"op":"CON","from":"the cancellation","to":"the merger","how":"came","quote":"the cancellation also came as Paramount Global … sought the Trump administration's approval for its $8.4 billion merger"}],
 "sp":null,"sd":0,"eq":null}
 
 3) "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."

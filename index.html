@@ -2501,45 +2501,62 @@ async function startReading(){
   // (facts → DEF, links → CON, judges → EVA) — no separate axis
   // classification, which a small model would just echo verbatim
   // from any example given.
-  const system=`You read ONE sentence and report what it says. Reply with ONLY a JSON object (no prose, no markdown, no code fence):
-{"fn":"what THIS sentence does — a short description (4-10 words), NOT a name",
-"facts":[{"e":"entity name","says":"attribute or action (4-14 words)"}],
-"link":{"from":"name A","to":"name B","how":"short verb"},
-"judge":{"about":"entity","claim":"what the text judges","holds":true},
-"sp":"speaker name or null","sd":0,
-"eq":"short=full or null"}
+  const system=`You read ONE sentence and report ONLY what it literally says. When in doubt, leave fields empty or null. Most sentences have NO link and NO judge.
 
-fn: a verb-phrase description of what the sentence DOES ("reports X", "introduces Y", "claims Z"). NEVER just an entity name. NEVER just a topic. A description.
-facts: each entry names ONE specific person/place/org/work and says what the sentence reports about it. Reuse names from priors when they appear. Empty [] if no specific named subject.
-link: ONE main relation between two named things, or null. "how" is a short verb ("advises", "founded", "killed", "cited"). null when the sentence has no clear two-thing relation.
-judge: the author's evaluation of an entity or claim, or null. Most sentences are null.
-sp: who is speaking the sentence (a person name) or null for the narrator.
-sd: 0=narrator/exposition, 1=quoted speech, 2=quote-within-quote.
-eq: alias map if a short form in this sentence refers to a known full name (e.g. "Walz=Tim Walz"); else null.
+Reply with ONLY a JSON object (no prose, no markdown, no code fence):
+{"fn":"verb-phrase: what THIS sentence does (4-10 words)",
+"facts":[{"e":"name","says":"what the sentence states","quote":"<5-25 words copied verbatim from the sentence proving this fact>"}],
+"link":null,
+"judge":null,
+"sp":null,"sd":0,
+"eq":null}
+
+GROUNDING — the most important rule:
+- Every fact MUST include a "quote" — a 5-25 word verbatim substring copied from the sentence below that proves the fact.
+- If you cannot find a verbatim span in the sentence that proves a fact, OMIT THE FACT.
+- Do NOT paraphrase the priors into facts. facts.says reports what THIS sentence says, with a verbatim quote from this sentence.
+
+DEFAULTS — null and empty are the right answers most of the time:
+- link is null for ~80% of sentences. Only include link when the sentence has a clear "X verbed Y" predicate, where the verb is literally in the sentence, and both X and Y are named in the sentence.
+  - "X said …", "X reported …", "X wrote …" → link is null. These are reporting verbs, not relations.
+  - "X is mentioned in the same paragraph as Y" → link is null. Not a relation.
+  - "X founded Y", "X advises Z", "X cited Y" → these ARE links.
+- judge is null for ~95% of sentences. Only include judge when the AUTHOR (not a quoted person) is evaluating an entity or claim.
+- facts is [] when the sentence is boilerplate, a header, a navigation crumb, a quote fragment, or makes no specific claim about a named entity.
 
 HOW TO READ THE USER MESSAGE:
-- The bracketed blocks are PRIORS — what the reading so far has established. Confirm what holds, correct what this clause overturns. They are NOT constraints; this clause can introduce something new or contradict a prior.
-- [passage so far: …] — the rolling working hypothesis for the passage
-- [named in this clause — working hypotheses …] — sites named in this clause along with the current working hypothesis for each. Reuse these names. The hypotheses are revisable.
-- [carried forward from last N clauses …] — sites recently in scope. Any pronoun (he, she, they, it) in this clause likely refers to one of them — pick the best match.
-- [fast-prior …] — the cheap mechanical reading of this clause. Treat as a hint, not a fact. Override when the actual sentence says otherwise.
+- The bracketed blocks are PRIORS — for ORIENTATION ONLY. They tell you which names are in scope and what's been said about them so far. They are NOT to be copied into your output.
+- [passage so far: …] — rolling working hypothesis for the passage
+- [named in this clause …] — sites named in THIS sentence with their current working hypothesis
+- [carried forward …] — sites in scope from the last few clauses; pick from these when this sentence has a pronoun ("he", "she", "they", "it")
+- [fast-prior …] — the mechanical extractor's cheap guess for this clause
 
 CRITICAL RULES:
-- Stay inside THIS sentence. The priors are for orientation ONLY. Do NOT copy the working-hypothesis text from the priors into facts.says — facts.says must report what THIS sentence actually says. If a sentence does not say something new about a prior site, that site goes in NEITHER facts NOR link.
+- Stay inside THIS sentence. Do NOT copy text from priors into facts.says or invent facts to match a prior. The "quote" field forces this: if there's no verbatim span in the sentence, no fact.
 - "I", "me", "my", "we", "us" refer to the NARRATOR. Not a named entity. If the subject is "I" with no named co-actor, set facts:[].
-- Attribute actions to the entity actually DOING them. "I have asked X about Y" → the narrator asked, X was asked, Y is the topic. Do not say Y did the asking just because Y is mentioned.
-- Resolve pronouns (he, she, they, it) using [carried forward …] only when there is a clear antecedent. If unclear, set facts:[].
+- Attribute actions to the entity actually DOING them. "I asked X about Y" → narrator asked, X was asked, Y is the topic. Do NOT make Y the asker just because Y is mentioned.
+- Resolve pronouns using [carried forward …] only when there is a clear antecedent. If unclear, omit.
 - fn is a description, not a tag. "reports the Mayor's announcement" ✓ — "Bill Lee" ✗.
-- If this clause is web chrome or boilerplate (a CTA, a header, a stray fragment, a subscription form prompt), output empty facts:[] and link:null. Do not invent connections just to have an answer.
 
-Example 1: "I have asked the Tennessean to correct its coverage, which cited John Buntin's report."
-→ {"fn":"narrator requests correction of Tennessean's coverage of Buntin's report","facts":[{"e":"Tennessean","says":"was asked to correct its coverage"},{"e":"John Buntin","says":"wrote a report that was cited"}],"link":{"from":"Tennessean","to":"John Buntin","how":"cited"},"judge":null,"sp":null,"sd":0,"eq":null}
+EXAMPLES — most have null link, null judge:
 
-Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
-→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null}
+1) "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
+→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019","quote":"Smith, who left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy","quote":"now advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null}
 
-Example 3 — boilerplate / chrome: "Click here to become a member."
-→ {"fn":"call-to-action boilerplate","facts":[],"link":null,"judge":null,"sp":null,"sd":0,"eq":null}`;
+2) "\"Not everybody's gonna love me,\" Allen said."
+→ {"fn":"quotes Allen on not being universally liked","facts":[{"e":"Allen","says":"said not everybody will love him","quote":"\"Not everybody's gonna love me,\" Allen said"}],"link":null,"judge":null,"sp":"Allen","sd":1,"eq":null}
+
+3) "In fact, his final show aired on Thursday, May 21, 2026."
+→ {"fn":"states the date of the final show","facts":[],"link":null,"judge":null,"sp":null,"sd":0,"eq":null}
+(facts is empty — "his" is a pronoun with no clear named referent in this sentence; the date is not about a named site.)
+
+4) "In a statement to NPR on Monday, CBS said that Colbert's 'Only In Monroe' episode was 'financed and produced by CBS studios'."
+→ {"fn":"CBS attributes the parody to CBS studios","facts":[{"e":"CBS","says":"called Colbert's Only In Monroe episode financed and produced by CBS studios","quote":"CBS said that Colbert's \"Only In Monroe\" episode was \"financed and produced by CBS studios\""},{"e":"Only In Monroe","says":"was financed and produced by CBS studios","quote":"\"financed and produced by CBS studios\""}],"link":null,"judge":null,"sp":"CBS","sd":1,"eq":null}
+(link is null — "X said Y" is a reporting verb, not a relation.)
+
+5) "Evan Agostini/Evan Agostini/Invision/AP/Invision hide caption toggle caption"
+→ {"fn":"image caption credit boilerplate","facts":[],"link":null,"judge":null,"sp":null,"sd":0,"eq":null}
+(boilerplate fragment — output empty.)`;
 
   const allReadings = [];
   let corrections = 0, confirmations = 0, skipped = 0, errors = [];
@@ -2825,7 +2842,13 @@ When there is no prior, use "refine".` },
       (graph.entities[a].mentions?.length || 0);
 
     const namedRanked = [...inClauseKeys].sort(rankByMentions).slice(0, 5);
-    const carryRanked = [...carryKeys].sort(rankByMentions).slice(0, 2);
+    // Carry-forward priors exist for coreference: when this clause has
+    // a pronoun (he, she, they, it, his, her, their), the antecedent is
+    // probably one of the recently-mentioned sites. If there's no
+    // pronoun, the carry-forward block just biases the model toward
+    // re-emitting prior content. So gate it on actual pronoun presence.
+    const hasPronoun = /\b(he|she|they|it|him|her|them|his|hers|their|its)\b/i.test(r.clause || '');
+    const carryRanked = hasPronoun ? [...carryKeys].sort(rankByMentions).slice(0, 2) : [];
 
     const renderHyp = (key) => {
       const ent = graph.entities[key];
@@ -2874,9 +2897,13 @@ When there is no prior, use "refine".` },
     }
     const prev = graph.clauses.find(c => c.index === r.clauseIndex - 1);
     const next = graph.clauses.find(c => c.index === r.clauseIndex + 1);
-    if(prev) user += prev.text.slice(0, 100) + '\n';
-    user += `>>> ${r.clause.slice(0, 200)} <<<`;
-    if(next) user += '\n' + next.text.slice(0, 100);
+    // Send the model enough of the clause to actually read it. At 200
+    // chars a 600-char glob (image caption + lede) gets cut off before
+    // the real subject of the sentence, and the model dutifully reports
+    // on whatever appeared in the first 200 chars (often a photo credit).
+    if(prev) user += prev.text.slice(0, 140) + '\n';
+    user += `>>> ${r.clause.slice(0, 500)} <<<`;
+    if(next) user += '\n' + next.text.slice(0, 140);
 
 
     try {
@@ -2918,25 +2945,65 @@ When there is no prior, use "refine".` },
             return !!x && x.length < 80 && !isBareNarrator(x);
           };
 
+          // Grounding check: a fact's "quote" (or some chunk of "says")
+          // must actually appear in the clause text. The model was asked
+          // for verbatim quotes; we hold it to that. If a fact can't be
+          // grounded, drop it — this is the model's prediction-error
+          // signal, not a defensive filter.
+          const clauseNorm = ((r.clause || '') + ' ' + (prevClauseText || '')).toLowerCase().replace(/\s+/g, ' ');
+          const grounded = (quote, says) => {
+            const q = String(quote || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            if(q && q.length >= 8) {
+              // Trim quotation marks/punctuation that small models add.
+              const qStripped = q.replace(/^["'"\s.,;:!?]+|["'"\s.,;:!?]+$/g, '');
+              if(qStripped.length >= 8 && clauseNorm.includes(qStripped)) return true;
+            }
+            // Fallback: if the model didn't quote, accept the fact when
+            // any 3+ consecutive content words from "says" appear in the
+            // clause verbatim. Catches the case where the model paraphrased
+            // closely.
+            const words = String(says || '').toLowerCase().split(/\s+/)
+              .filter(w => w.length >= 4 && !/^(with|from|that|this|have|been|were|will|would|could|should|about|which|while|where|when|what)$/.test(w));
+            for(let k = 0; k <= words.length - 3; k++) {
+              const tri = words.slice(k, k + 3).join(' ');
+              if(clauseNorm.includes(tri)) return true;
+            }
+            return false;
+          };
+
           // facts — DEF events: what is said about each named entity
           if(Array.isArray(j.facts)) {
             for(const f of j.facts) {
               if(!f || typeof f !== 'object') continue;
               const e = String(f.e || f.entity || f.about || '').trim();
               const says = String(f.says || f.value || f.claim || '').trim();
+              const quote = String(f.quote || f.span || '').trim();
               if(!says || says.length >= 240) continue;
               if(!acceptReadName(e)) continue;
-              parsedFacts.push({ e, says });
+              if(!grounded(quote, says)) continue;
+              parsedFacts.push({ e, says, quote });
             }
           }
 
-          // link / links — CON events
+          // link / links — CON events. Same grounding rule: the verb
+          // ("how") should appear in the clause, otherwise it's the model
+          // fabricating a relation to satisfy the schema.
+          const verbInClause = (verb) => {
+            const v = String(verb || '').toLowerCase().trim();
+            if(!v) return false;
+            // Reject reporting verbs that are usually NOT relations.
+            if(/^(said|says|reported|reports|wrote|writes|notes|noted|stated|states|told|tells|asked|adds|added|mentioned)$/i.test(v)) return false;
+            // Look for the verb stem in the clause.
+            const stem = v.replace(/(ed|ing|s)$/, '');
+            return stem.length >= 3 && clauseNorm.includes(stem);
+          };
+
           const linkRaw = j.link || j.relation;
           if(linkRaw && typeof linkRaw === 'object') {
             const from = String(linkRaw.from || linkRaw.a || '').trim();
             const to = String(linkRaw.to || linkRaw.b || '').trim();
-            const how = String(linkRaw.how || linkRaw.rel || linkRaw.type || 'related_to').trim();
-            if(acceptReadName(from) && acceptReadName(to) && from.toLowerCase() !== to.toLowerCase()) {
+            const how = String(linkRaw.how || linkRaw.rel || linkRaw.type || '').trim();
+            if(acceptReadName(from) && acceptReadName(to) && from.toLowerCase() !== to.toLowerCase() && verbInClause(how)) {
               parsedRelations.push({ from, to, how: how.slice(0, 40) });
               parsedLink = `${from} ${how} ${to}`;
             }
@@ -2946,8 +3013,8 @@ When there is no prior, use "refine".` },
               if(!lk || typeof lk !== 'object') continue;
               const from = String(lk.from || '').trim();
               const to = String(lk.to || '').trim();
-              const how = String(lk.how || lk.rel || 'related_to').trim();
-              if(acceptReadName(from) && acceptReadName(to) && from.toLowerCase() !== to.toLowerCase()) {
+              const how = String(lk.how || lk.rel || '').trim();
+              if(acceptReadName(from) && acceptReadName(to) && from.toLowerCase() !== to.toLowerCase() && verbInClause(how)) {
                 parsedRelations.push({ from, to, how: how.slice(0, 40) });
               }
             }

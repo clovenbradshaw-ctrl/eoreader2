@@ -2494,24 +2494,28 @@ async function startReading(){
   // about them, what relations are drawn, and what the author judges.
   // The classification axes (q1/q2/q3) ride along but are no longer
   // the point of the call.
+  // The per-clause READ prompt. Asks the model to actually read the
+  // sentence and report what it says: who is named, what is said
+  // about them, what relations are drawn, what is judged. Op/site/
+  // stance for the clause are now DERIVED from this reading content
+  // (facts → DEF, links → CON, judges → EVA) — no separate axis
+  // classification, which a small model would just echo verbatim
+  // from any example given.
   const system=`You read ONE sentence and report what it says. Reply with ONLY a JSON object (no prose, no markdown, no code fence):
-{"fn":"what this sentence does (4-10 words)",
+{"fn":"what THIS sentence does — a short description (4-10 words), NOT a name",
 "facts":[{"e":"entity name","says":"attribute or action (4-14 words)"}],
 "link":{"from":"name A","to":"name B","how":"short verb"},
 "judge":{"about":"entity","claim":"what the text judges","holds":true},
 "sp":"speaker name or null","sd":0,
-"eq":"short=full or null",
-"q1":2,"q2":2,"q3":2}
+"eq":"short=full or null"}
 
-facts: each entry names ONE specific person/place/org/work and says what the sentence reports about it. Reuse names from [known: …] when they appear. Empty [] if no specific named subject.
-link: ONE main relation between two named things, or null. "how" is a short verb ("advises", "founded", "killed", "depends_on").
-judge: the author's evaluation of an entity or claim. null for most sentences.
+fn: a verb-phrase description of what the sentence DOES ("reports X", "introduces Y", "claims Z"). NEVER just an entity name. NEVER just a topic. A description.
+facts: each entry names ONE specific person/place/org/work and says what the sentence reports about it. Reuse names from priors when they appear. Empty [] if no specific named subject.
+link: ONE main relation between two named things, or null. "how" is a short verb ("advises", "founded", "killed", "cited"). null when the sentence has no clear two-thing relation.
+judge: the author's evaluation of an entity or claim, or null. Most sentences are null.
 sp: who is speaking the sentence (a person name) or null for the narrator.
 sd: 0=narrator/exposition, 1=quoted speech, 2=quote-within-quote.
 eq: alias map if a short form in this sentence refers to a known full name (e.g. "Walz=Tim Walz"); else null.
-q1: 1=separating 2=connecting 3=producing
-q2: 1=existence 2=organization 3=meaning
-q3: 1=background 2=particular 3=pattern
 
 HOW TO READ THE USER MESSAGE:
 - The bracketed blocks are PRIORS — what the reading so far has established. Confirm what holds, correct what this clause overturns. They are NOT constraints; this clause can introduce something new or contradict a prior.
@@ -2521,16 +2525,21 @@ HOW TO READ THE USER MESSAGE:
 - [fast-prior …] — the cheap mechanical reading of this clause. Treat as a hint, not a fact. Override when the actual sentence says otherwise.
 
 CRITICAL RULES:
-- "I", "me", "my", "we", "us" refer to the NARRATOR (the author of the text). They are NOT any named entity in the sentence. If the subject is "I", set facts:[] unless a named entity is also acting.
-- Attribute actions to the entity actually doing them. If the sentence says "I have asked X" do NOT say a named person mentioned later in the sentence asked X — that person is the OBJECT, not the subject.
-- Resolve pronouns (he, she, they, it) using the [carried forward …] list when no antecedent is in this clause. If no good match exists, set facts:[].
-- Stay close to what the sentence actually says. Do not invent facts about a site just because it is in the priors.
+- Stay inside THIS sentence. The priors are for orientation ONLY. Do NOT copy the working-hypothesis text from the priors into facts.says — facts.says must report what THIS sentence actually says. If a sentence does not say something new about a prior site, that site goes in NEITHER facts NOR link.
+- "I", "me", "my", "we", "us" refer to the NARRATOR. Not a named entity. If the subject is "I" with no named co-actor, set facts:[].
+- Attribute actions to the entity actually DOING them. "I have asked X about Y" → the narrator asked, X was asked, Y is the topic. Do not say Y did the asking just because Y is mentioned.
+- Resolve pronouns (he, she, they, it) using [carried forward …] only when there is a clear antecedent. If unclear, set facts:[].
+- fn is a description, not a tag. "reports the Mayor's announcement" ✓ — "Bill Lee" ✗.
+- If this clause is web chrome or boilerplate (a CTA, a header, a stray fragment, a subscription form prompt), output empty facts:[] and link:null. Do not invent connections just to have an answer.
 
 Example 1: "I have asked the Tennessean to correct its coverage, which cited John Buntin's report."
-→ {"fn":"narrator requests correction of coverage citing Buntin's report","facts":[{"e":"Tennessean","says":"was asked to correct its coverage"},{"e":"John Buntin","says":"wrote a report that was cited"}],"link":{"from":"Tennessean","to":"John Buntin","how":"cited"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}
+→ {"fn":"narrator requests correction of Tennessean's coverage of Buntin's report","facts":[{"e":"Tennessean","says":"was asked to correct its coverage"},{"e":"John Buntin","says":"wrote a report that was cited"}],"link":{"from":"Tennessean","to":"John Buntin","how":"cited"},"judge":null,"sp":null,"sd":0,"eq":null}
 
 Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
-→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}`;
+→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null}
+
+Example 3 — boilerplate / chrome: "Click here to become a member."
+→ {"fn":"call-to-action boilerplate","facts":[],"link":null,"judge":null,"sp":null,"sd":0,"eq":null}`;
 
   const allReadings = [];
   let corrections = 0, confirmations = 0, skipped = 0, errors = [];
@@ -2583,6 +2592,164 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
     }
   }
 
+  // Tolerant JSON extractor — small models nest objects and arrays,
+  // so a single {[^}]+} regex isn't enough. Walks braces (ignoring
+  // string contents) to find the first balanced JSON object. Hoisted
+  // here so the per-clause read AND the hypothesis revision blocks
+  // below can share it.
+  function extractBalancedJson(s) {
+    const start = s.indexOf('{');
+    if(start < 0) return null;
+    let depth = 0, inStr = false, esc = false;
+    for(let p = start; p < s.length; p++) {
+      const ch = s[p];
+      if(esc) { esc = false; continue; }
+      if(ch === '\\') { esc = true; continue; }
+      if(ch === '"') { inStr = !inStr; continue; }
+      if(inStr) continue;
+      if(ch === '{') depth++;
+      else if(ch === '}') { depth--; if(depth === 0) return s.slice(start, p + 1); }
+    }
+    return null;
+  }
+
+  // Doc working hypothesis evolves at intervals, on each new section,
+  // and at end of reading. Pulls the strongest site hypotheses plus a
+  // handful of high-salience source clauses and asks the model to
+  // refine, recast, correct, or hold. Returns true if the hypothesis
+  // changed.
+  async function reviseDocHypothesis(atClauseIdx, trigger) {
+    if(!llmEngine) return false;
+    try {
+      const ranked = Object.entries(graph.entities)
+        .filter(([, e]) => e.hypothesis)
+        .sort(([, a], [, b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
+        .slice(0, 8);
+      // Only revise if we have something to revise FROM. On a tiny
+      // sample (1 entity), the prior reading is as good as we can get.
+      if(ranked.length < 2 && (sectionHyps || []).length < 1) return false;
+
+      const entLines = ranked.map(([, e]) =>
+        `  • ${e.name}: ${e.hypothesis}`).join('\n') || '  (no site hypotheses yet)';
+
+      const secLines = (sectionHyps || [])
+        .slice(-6)
+        .map((s, j) => `  ${j + 1}. [c${(s.from||0)+1}–c${(s.to||0)+1}] ${s.text}`)
+        .join('\n');
+
+      const readSet = new Set(allReadings.map(ar => ar.clauseIndex));
+      const docSourcePicks = [...allResults]
+        .filter(ar => readSet.has(ar.clauseIndex) && (ar.salience || 0) > 0.25)
+        .sort((a, b) => (b.salience || 0) - (a.salience || 0))
+        .slice(0, 5);
+      const docSourceBlock = docSourcePicks
+        .sort((a, b) => a.clauseIndex - b.clauseIndex)
+        .map(ar => `  [c${ar.clauseIndex + 1}] "${(ar.clause || '').trim().slice(0, 220)}"`)
+        .join('\n');
+
+      const prior = docHyp || graph.hypotheses?.doc || '';
+      const priorRevs = (graph.hypotheses?.priorDocs || []).length;
+      const epistemic = `This is a WORKING HYPOTHESIS about the document — provisional, may be overturned by later reading.`;
+      const sectionsBlock = secLines ? `\n\nSECTION WORKING HYPOTHESES (rolling — the passage's read so far):\n${secLines}` : '';
+      const docRevPrompt = prior
+        ? `${epistemic}
+
+PRIOR WORKING HYPOTHESIS (rev ${priorRevs}):
+"${prior}"
+
+WORKING HYPOTHESES about the main sites in this text:
+${entLines}${sectionsBlock}
+
+PRIMARY SOURCE — high-salience clauses read so far (verbatim):
+${docSourceBlock || '  (none above threshold)'}
+
+Revise into ONE sentence (under 35 words) for what this document is and what it is about. Build on the prior reading. Overturn it if the sites, the sections, or the source contradict it. Do not invent an author — only state authorship if a site hypothesis directly supports it.`
+        : `${epistemic}
+
+WORKING HYPOTHESES about the main sites in this text:
+${entLines}${sectionsBlock}
+
+PRIMARY SOURCE — high-salience clauses read so far (verbatim):
+${docSourceBlock || '  (none above threshold)'}
+
+Write ONE sentence (under 35 words) for what this document is and what it is about. Do not invent an author.`;
+
+      const revReply = await llmEngine.chat.completions.create({
+        messages: [
+          { role: 'system', content: `You are building a working hypothesis about a document. Reply with ONLY a JSON object:
+{"h":"<one specific sentence under 35 words>",
+"move":"recast|refine|correct|hold",
+"why":"<a few words>"}
+
+"move": "recast" = changing the FRAME of what kind of text this is or what it's centrally about. "refine" = same frame, sharper. "correct" = the prior had an error. "hold" = nothing meaningful to add.
+When there is no prior, use "refine".` },
+          { role: 'user', content: docRevPrompt },
+        ],
+        max_tokens: 180, temperature: 0.2,
+      });
+      const rawDoc = (revReply.choices[0]?.message?.content || '').trim();
+      let revised = '', docMove = 'refine', docWhy = '';
+      try {
+        const cleaned = rawDoc.replace(/```json\s*/g,'').replace(/```/g,'').trim();
+        const jsonStr = extractBalancedJson(cleaned) || cleaned.match(/\{[\s\S]+\}/)?.[0];
+        if(jsonStr) {
+          const j = JSON.parse(jsonStr);
+          revised = stripPreamble(String(j.h || j.hypothesis || '')).trim();
+          const m = String(j.move || j.kind || '').toLowerCase().trim();
+          if(['recast','refine','correct','hold'].includes(m)) docMove = m;
+          if(j.why) docWhy = String(j.why).slice(0, 120);
+        }
+      } catch(_) {}
+      if(!revised) revised = stripPreamble(rawDoc).slice(0, 450);
+      if(revised && revised.length > 15 && revised.length < 500) {
+        const changed = !prior || prior !== revised;
+        let docOp, docStance;
+        if(!prior) { docOp = 'INS'; docStance = 'Composing'; }
+        else if(docMove === 'hold' || !changed) { docOp = 'NUL'; docStance = 'Clearing'; }
+        else if(docMove === 'recast') { docOp = 'REC'; docStance = 'Composing'; }
+        else if(docMove === 'correct') { docOp = 'REC'; docStance = 'Dissecting'; }
+        else { docOp = 'SYN'; docStance = 'Composing'; }
+
+        graph.hypotheses = graph.hypotheses || {};
+        graph.hypotheses.priorDocs = graph.hypotheses.priorDocs || [];
+        if(prior && prior !== revised) {
+          graph.hypotheses.priorDocs.push({
+            text: prior,
+            supersededAt: atClauseIdx,
+            supersedingMove: docMove,
+            supersedingOp: docOp,
+            why: docWhy,
+            trigger,
+            entityCount: ranked.length,
+          });
+        }
+
+        graph.hypotheses.docLog = graph.hypotheses.docLog || [];
+        graph.hypotheses.docLog.push({
+          op: docOp, site: 'Kind', stance: docStance,
+          ts: new Date().toISOString(),
+          clauseIndex: atClauseIdx,
+          move: docMove, why: docWhy, trigger,
+          hypothesisBefore: prior || null,
+          hypothesisAfter: revised,
+        });
+
+        if(changed) {
+          docHyp = revised;
+          graph.hypotheses.doc = revised;
+          graph.hypotheses.docRev = (graph.hypotheses.docRev || 0) + 1;
+          graph.hypotheses.lastMove = docMove;
+          graph.hypotheses.lastMoveOp = docOp;
+        }
+        graph.hypotheses.docStatus = 'working';
+        emit(docOp, 'Kind', docStance, 'doc-revision',
+          `${docMove} (${trigger}): ${revised.slice(0, 70)}`, atClauseIdx);
+        return changed;
+      }
+    } catch(_) { /* keep prior doc hypothesis on revision failure */ }
+    return false;
+  }
+
   for(let i = 0; i < toRead.length; i++){
     if(readingPriorityQueue.length > 0) {
       const pIdx = readingPriorityQueue.shift();
@@ -2612,18 +2779,11 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
       rawBuffer = [];
       sectionStart = r.clauseIndex;
 
-      if(sectionHyps.length > 0 && sectionHyps.length % 3 === 0) {
-        try {
-          const docPrompt = docHyp
-            ? `Current understanding of this text:\n"${docHyp}"\n\nNew section:\n"${sectionHyps[sectionHyps.length-1].text}"\n\nRevise your understanding. One sentence. Keep what holds, add what's new.`
-            : `These are sections of a text:\n${sectionHyps.map((s,j) => `${j+1}. ${s.text}`).join('\n')}\n\nOne sentence summary. Under 20 words.`;
-          const compReply = await llmEngine.chat.completions.create({
-            messages:[{role:'user',content:docPrompt}],
-            max_tokens: 40, temperature: 0.1,
-          });
-          docHyp = stripPreamble((compReply.choices[0]?.message?.content || '').trim());
-        } catch(e) { /* keep existing docHyp */ }
-      }
+      // A new section landed — revise the doc working hypothesis
+      // against the updated section trail. Sections are the natural
+      // rollup level for the doc, so each one is a chance to refine
+      // or recast.
+      await reviseDocHypothesis(r.clauseIndex, 'new-section');
     }
 
     rawBuffer.push(r.clause.slice(0, 150));
@@ -2665,7 +2825,7 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
       (graph.entities[a].mentions?.length || 0);
 
     const namedRanked = [...inClauseKeys].sort(rankByMentions).slice(0, 5);
-    const carryRanked = [...carryKeys].sort(rankByMentions).slice(0, 3);
+    const carryRanked = [...carryKeys].sort(rankByMentions).slice(0, 2);
 
     const renderHyp = (key) => {
       const ent = graph.entities[key];
@@ -2733,31 +2893,11 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
       const raw = (reply.choices[0]?.message?.content || '').trim();
 
       let parsedOp = null, parsedSite = null, parsedStance = null, fn = null;
-      let parsedMode = null, parsedDomain = null, parsedObject = null;
       let parsedSpeaker = null, parsedSpeakerDepth = 0;
       let parsedSame = null, parsedLink = null;
       let parsedFacts = [];        // [{e, says}]   — DEF events
       let parsedRelations = [];    // [{from, to, how}] — CON events
       let parsedJudgments = [];    // [{about, claim, holds}] — EVA events
-
-      // Tolerant JSON extractor — small models often produce nested
-      // objects and arrays, so a single {[^}]+} regex isn't enough.
-      // Walk braces to find the first balanced JSON object.
-      function extractBalancedJson(s) {
-        const start = s.indexOf('{');
-        if(start < 0) return null;
-        let depth = 0, inStr = false, esc = false;
-        for(let p = start; p < s.length; p++) {
-          const ch = s[p];
-          if(esc) { esc = false; continue; }
-          if(ch === '\\') { esc = true; continue; }
-          if(ch === '"') { inStr = !inStr; continue; }
-          if(inStr) continue;
-          if(ch === '{') depth++;
-          else if(ch === '}') { depth--; if(depth === 0) return s.slice(start, p + 1); }
-        }
-        return null;
-      }
 
       try {
         const cleaned = raw.replace(/```json\s*/g,'').replace(/```/g,'').trim();
@@ -2822,85 +2962,27 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
             if(acceptReadName(about) && claim) parsedJudgments.push({ about, claim: claim.slice(0, 240), holds });
           }
 
-          // Speaker + alias passthrough (unchanged behaviour)
+          // Speaker + alias passthrough.
           if(j.sp && String(j.sp).toLowerCase() !== 'null') parsedSpeaker = String(j.sp).slice(0, 40);
           if(j.sd !== undefined && j.sd !== null) parsedSpeakerDepth = parseInt(j.sd) || 0;
           if(j.eq && typeof j.eq === 'string' && j.eq.includes('=') && j.eq !== 'short=full' && j.eq.toLowerCase() !== 'null') {
             parsedSame = j.eq;
           }
-
-          // Classification axes — still parsed, but now secondary.
-          // If the model omitted them, derive op/site/stance from the
-          // reading content below.
-          const q1 = (parseInt(j.q1||j.Q1||j['1']) || 0) - 1;
-          const q2 = (parseInt(j.q2||j.Q2||j['2']) || 0) - 1;
-          const q3 = (parseInt(j.q3||j.Q3||j['3']) || 0) - 1;
-          if(q1 >= 0 && q1 < 3 && q2 >= 0 && q2 < 3 && q3 >= 0 && q3 < 3) {
-            const MK = Object.keys(MODES);
-            const DK = Object.keys(DOMAINS);
-            const OK = Object.keys(OBJECTS);
-            parsedMode = MK[q1]; parsedDomain = DK[q2]; parsedObject = OK[q3];
-            parsedOp = OP_GRID[q1]?.[q2] || null;
-            parsedSite = SITE_GRID[q2]?.[q3] || null;
-            parsedStance = STANCE_GRID[q1]?.[q3] || null;
-          }
         }
       } catch(e) {}
 
-      // Reading-derived op/site/stance — used when the model didn't
-      // hand back numeric axes but DID actually read the sentence.
-      if(!parsedOp) {
-        if(parsedJudgments.length > 0) {
-          parsedOp = 'EVA'; parsedSite = 'Lens'; parsedStance = 'Tracing';
-        } else if(parsedRelations.length > 0) {
-          parsedOp = 'CON'; parsedSite = 'Network'; parsedStance = 'Binding';
-        } else if(parsedFacts.length > 0) {
-          parsedOp = 'DEF'; parsedSite = 'Entity'; parsedStance = 'Clearing';
-        }
-      }
-
-      if(!parsedOp) {
-        const numMatch = raw.match(/([1-3])\s*[,.\s]\s*([1-3])\s*[,.\s]\s*([1-3])\s*\|(.+)/);
-        if(numMatch) {
-          const q1 = parseInt(numMatch[1]) - 1;
-          const q2 = parseInt(numMatch[2]) - 1;
-          const q3 = parseInt(numMatch[3]) - 1;
-          const MK = Object.keys(MODES); const DK = Object.keys(DOMAINS); const OK = Object.keys(OBJECTS);
-          parsedMode = MK[q1]; parsedDomain = DK[q2]; parsedObject = OK[q3];
-          parsedOp = OP_GRID[q1]?.[q2] || null;
-          parsedSite = SITE_GRID[q2]?.[q3] || null;
-          parsedStance = STANCE_GRID[q1]?.[q3] || null;
-          fn = numMatch[4].trim().slice(0, 60);
-        }
-      }
-
-      if(!parsedOp) {
-        const lower = raw.toLowerCase();
-        const modeWords = {separating:0,connecting:1,producing:2,separate:0,connect:1,produce:2};
-        const domainWords = {existence:0,organization:1,meaning:2,exist:0,organ:1,mean:2};
-        const objectWords = {background:0,particular:1,pattern:2,backgr:0,partic:1,patt:2};
-        let q1=-1, q2=-1, q3=-1;
-        for(const[w,idx] of Object.entries(modeWords)){if(lower.includes(w)){q1=idx;break;}}
-        for(const[w,idx] of Object.entries(domainWords)){if(lower.includes(w)){q2=idx;break;}}
-        for(const[w,idx] of Object.entries(objectWords)){if(lower.includes(w)){q3=idx;break;}}
-        if(q1>=0 && q2>=0) {
-          parsedOp = OP_GRID[q1]?.[q2] || null;
-          if(q3>=0) { parsedSite = SITE_GRID[q2]?.[q3] || null; parsedStance = STANCE_GRID[q1]?.[q3] || null; }
-        }
-      }
-
-      if(!parsedOp) {
-        const digits = raw.match(/[1-3]/g);
-        if(digits && digits.length >= 2) {
-          const q1 = parseInt(digits[0]) - 1;
-          const q2 = parseInt(digits[1]) - 1;
-          const q3 = digits.length >= 3 ? parseInt(digits[2]) - 1 : 1;
-          if(q1>=0&&q1<3&&q2>=0&&q2<3) {
-            parsedOp = OP_GRID[q1]?.[q2] || null;
-            parsedSite = SITE_GRID[q2]?.[q3] || null;
-            parsedStance = STANCE_GRID[q1]?.[q3] || null;
-          }
-        }
+      // Op/site/stance for the clause derive from WHAT WAS READ:
+      // judgments → EVA, links → CON, facts → DEF. We deliberately do
+      // not ask the model for separate q1/q2/q3 axes — a small model
+      // just echoes whatever example values appear in the prompt,
+      // pinning every clause to the same operator (the bug that put
+      // CON(Link, Binding) on 100% of reads in a real session).
+      if(parsedJudgments.length > 0) {
+        parsedOp = 'EVA'; parsedSite = 'Lens'; parsedStance = 'Tracing';
+      } else if(parsedRelations.length > 0) {
+        parsedOp = 'CON'; parsedSite = 'Network'; parsedStance = 'Binding';
+      } else if(parsedFacts.length > 0) {
+        parsedOp = 'DEF'; parsedSite = 'Entity'; parsedStance = 'Clearing';
       }
 
       if(fn) fn = fn.replace(/>>>/g,'').replace(/<<</g,'').replace(/\[describe the sentence\]/gi,'').replace(/^This specific sentence /i,'').trim().slice(0,80);
@@ -3066,6 +3148,14 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
             name: name, terrain: terrain || 'Entity',
             claims: [], edges: [], mentions: [], ledgers: {},
             stage: 'read', viaLLM: true,
+            eoLog: [{
+              op: 'INS', site: terrain || 'Entity', stance: 'Clearing',
+              ts: new Date().toISOString(),
+              clauseIndex: r.clauseIndex,
+              value: 'site introduced from llm-read',
+              span: r.clause.slice(0, 200),
+              provenance: 'llm-read',
+            }],
           };
           emit('INS', terrain || 'Entity', 'Clearing', name, 'llm-read', r.clauseIndex);
         }
@@ -3097,6 +3187,14 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
         ent.mentions.push(r.clauseIndex);
         graph.claims.push(claim);
         newClaimsAdded.push(claim);
+        ent.eoLog = ent.eoLog || [];
+        ent.eoLog.push({
+          op: 'DEF', site: 'Entity', stance: 'Clearing',
+          ts: new Date().toISOString(),
+          clauseIndex: r.clauseIndex,
+          value: f.says, span: r.clause.slice(0, 200),
+          provenance: 'llm-read',
+        });
         emit('DEF', 'Entity', 'Clearing', ent.name, f.says.slice(0, 80), r.clauseIndex);
       }
 
@@ -3128,6 +3226,19 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
           b.object === binding.object && b.clauseIndex === binding.clauseIndex
         );
         if(!dupeBind) graph.bindings.push(binding);
+        const conEntry = {
+          op: 'CON', site: 'Network', stance: 'Binding',
+          ts: new Date().toISOString(),
+          clauseIndex: r.clauseIndex,
+          value: `${rel.how}→${toEnt.name}`,
+          relation: rel.how, to: toEnt.name,
+          span: r.clause.slice(0, 200),
+          provenance: 'llm-read',
+        };
+        fromEnt.eoLog = fromEnt.eoLog || [];
+        fromEnt.eoLog.push(conEntry);
+        toEnt.eoLog = toEnt.eoLog || [];
+        toEnt.eoLog.push({ ...conEntry, value: `←${rel.how} ${fromEnt.name}`, from: fromEnt.name });
         emit('CON', 'Network', 'Binding', fromEnt.name, `${rel.how}→${toEnt.name}`, r.clauseIndex);
       }
 
@@ -3149,6 +3260,16 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
         ent.claims.push(claim);
         ent.mentions.push(r.clauseIndex);
         graph.claims.push(claim);
+        ent.eoLog = ent.eoLog || [];
+        ent.eoLog.push({
+          op: 'EVA', site: 'Lens', stance: 'Tracing',
+          ts: new Date().toISOString(),
+          clauseIndex: r.clauseIndex,
+          value: jdg.claim,
+          status: jdg.holds ? 'holds' : 'fails',
+          span: r.clause.slice(0, 200),
+          provenance: 'llm-read',
+        });
         emit('EVA', 'Lens', 'Tracing', ent.name,
           `${jdg.holds ? '✓' : '✗'} ${jdg.claim.slice(0, 60)}`, r.clauseIndex);
       }
@@ -3237,7 +3358,7 @@ ${sourceBlock}
 DISTILLED READINGS so far:
 ${factLines || '  (none)'}
 
-Revise into ONE specific sentence (under 30 words) describing who or what ${ent.name} is in this text. Keep what the source supports. Drop what later clauses overturned. Be specific — name a role, an action, an attribute — not "${ent.name} is mentioned". If the source is too thin to support a claim, say so honestly.`
+Revise into ONE specific sentence (under 30 words) describing who or what ${ent.name} is in this text. Keep what the source supports. Drop what later clauses overturned. Be specific. ALSO declare what kind of conceptual move this revision is.`
             : `${epistemic}
 
 SITE: ${ent.name}
@@ -3249,114 +3370,108 @@ ${sourceBlock}
 DISTILLED READINGS:
 ${factLines || '  (none)'}
 
-Write ONE specific sentence (under 30 words) for who or what ${ent.name} is in this text. Stay close to what the source actually says.`;
+Write ONE specific sentence (under 30 words) for who or what ${ent.name} is in this text.`;
+          // Ask the model to declare what kind of conceptual move its
+          // revision is — so we can store it in EO notation. REC is the
+          // operator for changing the frame we are thinking about
+          // something in. SYN is composing what's there into a unified
+          // reading. NUL is no change.
           const hypReply = await llmEngine.chat.completions.create({
             messages: [
-              { role: 'system', content: 'You are building a working hypothesis about who or what a named site in a text is. Reply with ONE specific sentence and nothing else — no preamble, no quotes around it, no labels.' },
+              { role: 'system', content: `You are building a working hypothesis about a named site in a text. Reply with ONLY a JSON object (no prose, no markdown):
+{"h":"<one specific sentence under 30 words>",
+"move":"recast|refine|correct|hold",
+"why":"<a few words for why this move>"}
+
+"move":
+- "recast" = changing the FRAME — different role, category, or what kind of thing the site is. Use when the new reading is not just more detail but a different conception.
+- "refine" = same frame, more specific. Adding detail or sharpening, not changing what kind of thing the site is.
+- "correct" = the prior hypothesis had a factual error and this fixes it.
+- "hold" = nothing meaningful to add; the prior still stands.
+
+When there is no prior, use "refine".` },
               { role: 'user', content: entPrompt },
             ],
-            max_tokens: 90, temperature: 0.2,
+            max_tokens: 160, temperature: 0.2,
           });
-          const newHyp = stripPreamble((hypReply.choices[0]?.message?.content || '').trim());
+          const raw = (hypReply.choices[0]?.message?.content || '').trim();
+          let newHyp = '', move = 'refine', why = '';
+          try {
+            const cleaned = raw.replace(/```json\s*/g,'').replace(/```/g,'').trim();
+            const jsonStr = extractBalancedJson(cleaned) || cleaned.match(/\{[\s\S]+\}/)?.[0];
+            if(jsonStr) {
+              const j = JSON.parse(jsonStr);
+              newHyp = stripPreamble(String(j.h || j.hypothesis || '')).trim();
+              const m = String(j.move || j.kind || '').toLowerCase().trim();
+              if(['recast','refine','correct','hold'].includes(m)) move = m;
+              if(j.why) why = String(j.why).slice(0, 120);
+            }
+          } catch(_) {}
+          // Fallback: model returned just a sentence.
+          if(!newHyp) newHyp = stripPreamble(raw).slice(0, 350);
           if(newHyp && newHyp.length > 8 && newHyp.length < 400) {
+            const changed = !priorHyp || priorHyp !== newHyp;
+            // Map the declared move to an EO operator. This is the
+            // typed record of HOW the graph's understanding of this
+            // site is changing, stored in EO notation.
+            let eoOp, eoStance;
+            if(!priorHyp) {
+              eoOp = 'INS'; eoStance = 'Composing';
+            } else if(move === 'hold' || !changed) {
+              eoOp = 'NUL'; eoStance = 'Clearing';
+            } else if(move === 'recast') {
+              eoOp = 'REC'; eoStance = 'Composing';
+            } else if(move === 'correct') {
+              eoOp = 'REC'; eoStance = 'Dissecting';
+            } else {
+              eoOp = 'SYN'; eoStance = 'Composing';
+            }
+
             ent.priorHypotheses = ent.priorHypotheses || [];
             if(priorHyp && priorHyp !== newHyp) {
               ent.priorHypotheses.push({
                 text: priorHyp,
                 supersededAt: r.clauseIndex,
                 supersededBy: 'llm-revision',
+                supersedingMove: move,
+                supersedingOp: eoOp,
+                why,
                 factCountAtTime: ent._llmFactCount - 1,
               });
             }
-            ent.hypothesis = newHyp;
-            ent.hypothesisRev = (ent.hypothesisRev || 0) + 1;
+
+            // Per-site EO log: the typed record of moves that built the
+            // current working hypothesis.
+            ent.eoLog = ent.eoLog || [];
+            ent.eoLog.push({
+              op: eoOp, site: 'Entity', stance: eoStance,
+              ts: new Date().toISOString(),
+              clauseIndex: r.clauseIndex,
+              move, why,
+              hypothesisBefore: priorHyp || null,
+              hypothesisAfter: newHyp,
+            });
+
+            if(changed) {
+              ent.hypothesis = newHyp;
+              ent.hypothesisRev = (ent.hypothesisRev || 0) + 1;
+              ent.lastMove = move;
+              ent.lastMoveOp = eoOp;
+            }
             ent.hypothesisStatus = 'working';
-            emit('SYN', 'Entity', 'Composing', ent.name,
-              newHyp.slice(0, 80), r.clauseIndex);
+            emit(eoOp, 'Entity', eoStance, ent.name,
+              `${move}: ${newHyp.slice(0, 70)}`, r.clauseIndex);
           }
         } catch(_) { /* keep prior hypothesis on revision failure */ }
       }
 
-      // Every ~20 clauses, re-evaluate the doc working hypothesis using
-      // the best site hypotheses we've accumulated, plus a few of the
-      // highest-salience source clauses as primary text. The model can
-      // — and should — overturn the early doc-id guess if later
-      // evidence points elsewhere.
-      if(i > 0 && i % 20 === 0) {
-        try {
-          const ranked = Object.entries(graph.entities)
-            .filter(([, e]) => e.hypothesis)
-            .sort(([, a], [, b]) =>
-              (b.mentions?.length || 0) - (a.mentions?.length || 0))
-            .slice(0, 8);
-          if(ranked.length >= 2) {
-            const entLines = ranked.map(([, e]) =>
-              `  • ${e.name}: ${e.hypothesis}`).join('\n');
-            // Primary-source sample for the doc hypothesis — high-salience
-            // clauses we've read so far, capped so the prompt stays small.
-            const readSoFar = allReadings.map(ar => ar.clauseIndex);
-            const readSet = new Set(readSoFar);
-            const docSourcePicks = [...allResults]
-              .filter(ar => readSet.has(ar.clauseIndex) && (ar.salience || 0) > 0.25)
-              .sort((a, b) => (b.salience || 0) - (a.salience || 0))
-              .slice(0, 5);
-            const docSourceBlock = docSourcePicks
-              .sort((a, b) => a.clauseIndex - b.clauseIndex)
-              .map(ar => `  [c${ar.clauseIndex + 1}] "${(ar.clause || '').trim().slice(0, 220)}"`)
-              .join('\n');
-
-            const prior = docHyp || graph.hypotheses?.doc || '';
-            const priorRevs = (graph.hypotheses?.priorDocs || []).length;
-            const epistemic = `This is a WORKING HYPOTHESIS about the document — provisional, may be overturned by later reading.`;
-            const docRevPrompt = prior
-              ? `${epistemic}
-
-PRIOR WORKING HYPOTHESIS (rev ${priorRevs}):
-"${prior}"
-
-WORKING HYPOTHESES about the main sites in this text:
-${entLines}
-
-PRIMARY SOURCE — high-salience clauses read so far (verbatim):
-${docSourceBlock || '  (none above threshold)'}
-
-Revise into ONE sentence (under 35 words) for what this document is and what it is about. Build on the prior reading. Overturn it if the sites and source contradict it. Do not invent an author — only state authorship if a site hypothesis directly supports it.`
-              : `${epistemic}
-
-WORKING HYPOTHESES about the main sites in this text:
-${entLines}
-
-PRIMARY SOURCE — high-salience clauses read so far (verbatim):
-${docSourceBlock || '  (none above threshold)'}
-
-Write ONE sentence (under 35 words) for what this document is and what it is about. Do not invent an author.`;
-            const revReply = await llmEngine.chat.completions.create({
-              messages: [
-                { role: 'system', content: 'You are building a working hypothesis about a document. Reply with ONE specific sentence and nothing else — no preamble, no quotes.' },
-                { role: 'user', content: docRevPrompt },
-              ],
-              max_tokens: 110, temperature: 0.2,
-            });
-            const revised = stripPreamble((revReply.choices[0]?.message?.content || '').trim());
-            if(revised && revised.length > 15 && revised.length < 500) {
-              graph.hypotheses = graph.hypotheses || {};
-              graph.hypotheses.priorDocs = graph.hypotheses.priorDocs || [];
-              if(prior && prior !== revised) {
-                graph.hypotheses.priorDocs.push({
-                  text: prior,
-                  supersededAt: r.clauseIndex,
-                  entityCount: ranked.length,
-                });
-              }
-              docHyp = revised;
-              graph.hypotheses.doc = revised;
-              graph.hypotheses.docRev = (graph.hypotheses.docRev || 0) + 1;
-              graph.hypotheses.docStatus = 'working';
-              emit('SYN', 'Kind', 'Composing', 'doc-revision',
-                revised.slice(0, 100), r.clauseIndex);
-            }
-          }
-        } catch(_) { /* keep prior doc hypothesis on revision failure */ }
+      // The doc working hypothesis evolves like a site hypothesis does:
+      // fired at clause intervals, fired whenever a new section
+      // hypothesis lands (sections are natural rollups), and once
+      // unconditionally at end of reading. See reviseDocHypothesis
+      // helper below.
+      if(i > 0 && i % 8 === 0) {
+        await reviseDocHypothesis(r.clauseIndex, 'interval');
       }
 
       prevClauseText = r.clause;
@@ -3400,16 +3515,11 @@ Write ONE sentence (under 35 words) for what this document is and what it is abo
     sectionHyps.push({ text: paraHyp, from: sectionStart, to: toRead.length > 0 ? toRead[toRead.length-1].clauseIndex : 0 });
   }
 
-  if(!docHyp && sectionHyps.length >= 2 && llmEngine) {
-    try {
-      const docPrompt = `These are sections of a text:\n${sectionHyps.map((s,j) => `${j+1}. ${s.text}`).join('\n')}\n\nOne sentence about what this text is. Under 20 words.`;
-      const compReply = await llmEngine.chat.completions.create({
-        messages:[{role:'user',content:docPrompt}],
-        max_tokens: 40, temperature: 0.1,
-      });
-      docHyp = stripPreamble((compReply.choices[0]?.message?.content || '').trim());
-    } catch(e) {}
-  }
+  // Final pass: revise the doc working hypothesis against EVERYTHING
+  // we've accumulated. Runs unconditionally so even short docs (where
+  // the interval-based revision never fired) get one rollup at the end.
+  const finalIdx = toRead.length > 0 ? toRead[toRead.length - 1].clauseIndex : 0;
+  await reviseDocHypothesis(finalIdx, 'final');
 
   graph.hypotheses = {
     doc: docHyp || graph.hypotheses?.doc || '',
@@ -3944,23 +4054,41 @@ function renderReadings(){
   const fallbacks=readings.filter(r=>r.fallback).length;
   let html='';
 
+  // EO-op badge — small colored chip for the operator on a revision.
+  // REC (frame change) gets the warn color; SYN (refinement) the accent;
+  // NUL the dim. Lets you see at a glance whether a revision recast or
+  // just sharpened the prior.
+  const opBadge = (op, move) => {
+    if(!op) return '';
+    const col = op === 'REC' ? 'var(--warn)'
+      : op === 'SYN' ? 'var(--accent)'
+      : op === 'INS' ? '#5588aa'
+      : op === 'NUL' ? 'var(--dim)'
+      : 'var(--dim)';
+    const label = move ? `${op} · ${move}` : op;
+    return `<span style="display:inline-block;padding:0 5px;font-size:9px;border:1px solid ${col};color:${col};border-radius:2px;margin-right:6px;font-family:var(--mono);letter-spacing:0.04em">${label}</span>`;
+  };
+
   const hyps = graph.hypotheses || {};
   if(hyps.doc) {
     const docRev = hyps.docRev || 0;
     const revTag = docRev > 0 ? ` <span style="opacity:0.5;font-size:10px;font-weight:normal">rev ${docRev}</span>` : '';
-    html+=`<div class="hyp-box hyp-doc"><span class="hyp-label">WORKING HYP · DOC</span>${revTag} ${esc(hyps.doc)}</div>`;
+    const lastOpTag = opBadge(hyps.lastMoveOp, hyps.lastMove);
+    html+=`<div class="hyp-box hyp-doc"><span class="hyp-label">WORKING HYP · DOC</span>${revTag} ${lastOpTag}${esc(hyps.doc)}</div>`;
     // Show the trail of revisions so you can SEE the reading evolve.
     const priors = hyps.priorDocs || [];
     if(priors.length > 0) {
       html+=`<details style="margin:4px 0 8px 12px;font-size:11px;color:var(--dim)"><summary style="cursor:pointer;opacity:0.7">${priors.length} prior reading${priors.length===1?'':'s'} — overturned</summary>`;
       for(const p of priors) {
-        html+=`<div style="padding:2px 0;opacity:0.6"><span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s></div>`;
+        html+=`<div style="padding:2px 0;opacity:0.6">${opBadge(p.supersedingOp, p.supersedingMove)}<span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s>${p.why?`<span style="opacity:0.5;margin-left:6px">— ${esc(p.why)}</span>`:''}</div>`;
       }
       html+=`</details>`;
     }
   }
   // Site hypotheses — the model's evolving working hypothesis for who
-  // each named site is. The graph IS these hypotheses, not facts.
+  // each named site is. The graph IS these hypotheses, not facts. Each
+  // revision is stored as an EO event in ent.eoLog (REC when the frame
+  // changes, SYN when refined, NUL when held).
   const entHyps = Object.entries(graph.entities || {})
     .filter(([, e]) => e.hypothesis)
     .sort(([, a], [, b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
@@ -3970,14 +4098,15 @@ function renderReadings(){
     for(const [, e] of entHyps) {
       const priors = e.priorHypotheses || [];
       const rev = e.hypothesisRev || 0;
+      const lastOp = opBadge(e.lastMoveOp, e.lastMove);
       html+=`<div class="hyp-box" style="background:rgba(92,224,160,0.04);border-left:3px solid var(--green);font-size:12px">`;
       html+=`<span class="hyp-label" style="color:var(--green)">${esc(e.name)}</span>`;
       if(rev > 0) html+=` <span style="opacity:0.45;font-size:10px">rev ${rev}</span>`;
-      html+=` ${esc(e.hypothesis)}`;
+      html+=` ${lastOp}${esc(e.hypothesis)}`;
       if(priors.length > 0) {
         html+=`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:10px;opacity:0.5">${priors.length} overturned</summary>`;
         for(const p of priors) {
-          html+=`<div style="padding:1px 0;font-size:10px;opacity:0.55"><span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s></div>`;
+          html+=`<div style="padding:1px 0;font-size:10px;opacity:0.55">${opBadge(p.supersedingOp, p.supersedingMove)}<span style="opacity:0.5">c${(p.supersededAt||0)+1} ↺</span> <s>${esc(p.text)}</s>${p.why?`<span style="opacity:0.5;margin-left:6px">— ${esc(p.why)}</span>`:''}</div>`;
         }
         html+=`</details>`;
       }

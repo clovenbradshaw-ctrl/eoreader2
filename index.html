@@ -2513,11 +2513,18 @@ q1: 1=separating 2=connecting 3=producing
 q2: 1=existence 2=organization 3=meaning
 q3: 1=background 2=particular 3=pattern
 
+HOW TO READ THE USER MESSAGE:
+- The bracketed blocks are PRIORS — what the reading so far has established. Confirm what holds, correct what this clause overturns. They are NOT constraints; this clause can introduce something new or contradict a prior.
+- [passage so far: …] — the rolling working hypothesis for the passage
+- [named in this clause — working hypotheses …] — sites named in this clause along with the current working hypothesis for each. Reuse these names. The hypotheses are revisable.
+- [carried forward from last N clauses …] — sites recently in scope. Any pronoun (he, she, they, it) in this clause likely refers to one of them — pick the best match.
+- [fast-prior …] — the cheap mechanical reading of this clause. Treat as a hint, not a fact. Override when the actual sentence says otherwise.
+
 CRITICAL RULES:
 - "I", "me", "my", "we", "us" refer to the NARRATOR (the author of the text). They are NOT any named entity in the sentence. If the subject is "I", set facts:[] unless a named entity is also acting.
 - Attribute actions to the entity actually doing them. If the sentence says "I have asked X" do NOT say a named person mentioned later in the sentence asked X — that person is the OBJECT, not the subject.
-- Never invent a fact about an entity just because they are mentioned. Only report what the sentence directly says about them.
-- The [known: …] list is for reference, NOT a suggestion that every clause is about those entities.
+- Resolve pronouns (he, she, they, it) using the [carried forward …] list when no antecedent is in this clause. If no good match exists, set facts:[].
+- Stay close to what the sentence actually says. Do not invent facts about a site just because it is in the priors.
 
 Example 1: "I have asked the Tennessean to correct its coverage, which cited John Buntin's report."
 → {"fn":"narrator requests correction of coverage citing Buntin's report","facts":[{"e":"Tennessean","says":"was asked to correct its coverage"},{"e":"John Buntin","says":"wrote a report that was cited"}],"link":{"from":"Tennessean","to":"John Buntin","how":"cited"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}
@@ -2623,30 +2630,78 @@ Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone po
 
     let user = '';
 
-    if(paraHyp) user += `[about: ${paraHyp.slice(0, 80)}]\n`;
+    // ── Predictive context ────────────────────────────────────
+    // Predictive processing: before the slow LLM read of this clause,
+    // we already have a prior — what the surrounding text was about,
+    // who is currently in scope, what the fast mechanical layer thinks
+    // this clause does. We give the model that prior so the read
+    // becomes prediction-error correction (confirm or overturn), not
+    // naive extraction from scratch.
+    if(paraHyp) user += `[passage so far: "${paraHyp.slice(0, 100)}"]\n`;
 
+    // Sites currently in scope: anyone named in THIS clause, plus
+    // anyone mentioned in the previous ~3 clauses (still in coref
+    // range, likely the antecedent of any pronoun in this clause).
     const clauseLower = r.clause.toLowerCase();
-    const knownInClause = Object.entries(graph.entities)
-      .filter(([key, ent]) => {
-        if(clauseLower.includes(key)) return true;
-        const parts = key.split(' ');
-        return parts.some(p => p.length >= 3 && clauseLower.includes(p));
-      })
-      .sort(([,a], [,b]) => (b.mentions?.length || 0) - (a.mentions?.length || 0))
-      .slice(0, 6);
-    if(knownInClause.length > 0) {
-      // Show the model each known site's CURRENT working hypothesis when
-      // it has one. The per-clause read can build on, refine, or
-      // contradict the accumulated reading of that site, rather than
-      // starting from scratch every sentence. These are HYPOTHESES — the
-      // model can override them with what the current clause supports.
-      const hints = knownInClause.map(([key, ent]) => {
-        const kind = (ent.claims||[]).find(c => c.rawType === 'kind');
-        const tag = resolveEntity(key) + (kind ? ` (${kind.value})` : '');
-        if(ent.hypothesis) return `${tag} — working hypothesis: "${ent.hypothesis.slice(0, 110)}"`;
-        return tag;
-      });
-      user += `[known sites (working hypotheses — overridable by this clause):\n  ${hints.join('\n  ')}]\n`;
+    const inClauseKeys = new Set();
+    const carryWindow = 3;
+    const carryMin = r.clauseIndex - carryWindow;
+    const carryMax = r.clauseIndex - 1;
+    const carryKeys = new Set();
+
+    for(const [key, ent] of Object.entries(graph.entities)) {
+      // Match by canonical key or by any token of length ≥ 3.
+      const named = clauseLower.includes(key) ||
+        key.split(' ').some(p => p.length >= 3 && clauseLower.includes(p));
+      if(named) { inClauseKeys.add(key); continue; }
+      // Otherwise, was this site mentioned in the last few clauses?
+      if(ent.mentions && ent.mentions.some(m => m >= carryMin && m <= carryMax)) {
+        carryKeys.add(key);
+      }
+    }
+
+    const rankByMentions = (a, b) =>
+      (graph.entities[b].mentions?.length || 0) -
+      (graph.entities[a].mentions?.length || 0);
+
+    const namedRanked = [...inClauseKeys].sort(rankByMentions).slice(0, 5);
+    const carryRanked = [...carryKeys].sort(rankByMentions).slice(0, 3);
+
+    const renderHyp = (key) => {
+      const ent = graph.entities[key];
+      const kind = (ent.claims || []).find(c => c.rawType === 'kind');
+      const tag = resolveEntity(key) + (kind ? ` (${kind.value})` : '');
+      if(ent.hypothesis) return `${tag} — h: "${ent.hypothesis.slice(0, 110)}"`;
+      return tag;
+    };
+
+    if(namedRanked.length > 0) {
+      user += `[named in this clause — working hypotheses (revisable by this clause):\n  ${namedRanked.map(renderHyp).join('\n  ')}]\n`;
+    }
+    if(carryRanked.length > 0) {
+      // Carry-forward: sites recently in scope. Any pronoun in this
+      // clause probably refers to one of them. Listing them is the
+      // PRIOR for coreference resolution — the model should choose
+      // among these unless the clause clearly introduces something new.
+      user += `[carried forward from last ${carryWindow} clauses (likely referents for pronouns):\n  ${carryRanked.map(renderHyp).join('\n  ')}]\n`;
+    }
+
+    // Fast prior: what the mechanical extraction layer already produced
+    // for this clause. Embedding-classification has tagged an op/site/
+    // stance; the entity extractor has guessed at named subjects. This
+    // is the cheap, contextual reading the slow LLM read can confirm or
+    // overturn — predictive processing's fast pass.
+    const fastBits = [];
+    if(r.operator?.name && r.operator.name !== '—') {
+      fastBits.push(`op=${r.operator.name}(${r.terrain?.name||'?'}, ${r.stance?.name||'?'})`);
+    }
+    const fastSubjects = (r.claims || [])
+      .map(c => c.entity)
+      .filter(e => e && !String(e).startsWith('(') && e !== '?')
+      .slice(0, 4);
+    if(fastSubjects.length) fastBits.push(`subjects: ${[...new Set(fastSubjects)].join(', ')}`);
+    if(fastBits.length) {
+      user += `[fast-prior (mechanical reading; LLM may confirm or overturn): ${fastBits.join(' · ')}]\n`;
     }
 
     if(r.quoteState) {

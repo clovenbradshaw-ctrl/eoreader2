@@ -2257,13 +2257,22 @@ async function processText(text) {
       const entityList = topEntities.map(([n]) => n).join(', ');
       const idReply = await llmEngine.chat.completions.create({
         messages: [
-          { role: 'system', content: 'Identify this text in one sentence. What is it? Who wrote it? What genre?' },
-          { role: 'user', content: `Entities: ${entityList}\nShape: ${textShape}, ${clauseCount} passages\nOpening:\n${sample}\n\nKey passages:\n${surpriseSpans}` },
+          // Do NOT ask "who wrote it" — we don't pass a byline, so a small
+          // model will just confabulate from the most-mentioned name in the
+          // entity list (e.g. naming a council member as the author). Only
+          // ask what the text IS about.
+          { role: 'system', content: 'Identify this text in ONE sentence: what is it about and what kind of text is it (article, essay, post, report)? Do NOT name an author unless one is explicitly given. Do not invent a name. Under 25 words.' },
+          { role: 'user', content: `Named entities mentioned (these are subjects of the text, NOT the author):\n${entityList}\n\nShape: ${textShape}, ${clauseCount} passages\n\nOpening:\n${sample}\n\nKey passages:\n${surpriseSpans}` },
         ],
-        max_tokens: 60,
+        max_tokens: 80,
         temperature: 0.1,
       });
-      const identification = (idReply.choices[0]?.message?.content || '').trim();
+      let identification = (idReply.choices[0]?.message?.content || '').trim();
+      // Strip any confabulated authorship — small models still insert it.
+      identification = identification
+        .replace(/,?\s+(?:written|authored)\s+by\s+[^.,;]+/gi, '')
+        .replace(/\bby\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s*\.?\s*$/g, '')
+        .trim();
       if(identification.length > 10) {
         instantHyp = identification;
       }
@@ -2507,8 +2516,17 @@ q1: 1=separating 2=connecting 3=producing
 q2: 1=existence 2=organization 3=meaning
 q3: 1=background 2=particular 3=pattern
 
-Example input sentence: "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
-Example output: {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}`;
+CRITICAL RULES:
+- "I", "me", "my", "we", "us" refer to the NARRATOR (the author of the text). They are NOT any named entity in the sentence. If the subject is "I", set facts:[] unless a named entity is also acting.
+- Attribute actions to the entity actually doing them. If the sentence says "I have asked X" do NOT say a named person mentioned later in the sentence asked X — that person is the OBJECT, not the subject.
+- Never invent a fact about an entity just because they are mentioned. Only report what the sentence directly says about them.
+- The [known: …] list is for reference, NOT a suggestion that every clause is about those entities.
+
+Example 1: "I have asked the Tennessean to correct its coverage, which cited John Buntin's report."
+→ {"fn":"narrator requests correction of coverage citing Buntin's report","facts":[{"e":"Tennessean","says":"was asked to correct its coverage"},{"e":"John Buntin","says":"wrote a report that was cited"}],"link":{"from":"Tennessean","to":"John Buntin","how":"cited"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}
+
+Example 2: "Smith, who left Boeing in 2019, now advises the Pentagon on drone policy."
+→ {"fn":"reports Smith's career move and current advisory role","facts":[{"e":"Smith","says":"left Boeing in 2019"},{"e":"Smith","says":"advises the Pentagon on drone policy"}],"link":{"from":"Smith","to":"Pentagon","how":"advises"},"judge":null,"sp":null,"sd":0,"eq":null,"q1":2,"q2":2,"q3":2}`;
 
   const allReadings = [];
   let corrections = 0, confirmations = 0, skipped = 0, errors = [];
@@ -2692,16 +2710,48 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
           if(j.fn) fn = stripPreamble(String(j.fn)).slice(0, 80);
 
           // facts — DEF events: what is said about each named entity
+          // Filter out first/second/third-person pronouns and generic words —
+          // small models often label "I"/"the narrator"/"author" as an entity.
+          const PRONOUN_NAMES = new Set([
+            'i','me','my','mine','myself','we','us','our','ours','ourselves',
+            'you','your','yours','yourself','yourselves',
+            'he','him','his','himself','she','her','hers','herself',
+            'they','them','their','theirs','themselves','it','its','itself',
+            'this','that','these','those','one','someone','anyone','everyone',
+            'narrator','author','speaker','writer','reader','the narrator',
+            'the author','the speaker','the writer','the reader','the reporter',
+          ]);
           if(Array.isArray(j.facts)) {
             for(const f of j.facts) {
               if(!f || typeof f !== 'object') continue;
               const e = String(f.e || f.entity || f.about || '').trim();
               const says = String(f.says || f.value || f.claim || '').trim();
-              if(e && says && e.length < 80 && says.length < 200) {
-                parsedFacts.push({ e, says });
-              }
+              if(!e || !says || e.length >= 80 || says.length >= 200) continue;
+              if(PRONOUN_NAMES.has(e.toLowerCase())) continue;
+              // Don't accept a name that the sentence doesn't actually mention.
+              // Tiny models sometimes invent or carry over a [known:] entity
+              // into a clause that didn't reference it.
+              const elow = e.toLowerCase();
+              const inClause = r.clause.toLowerCase().includes(elow) ||
+                elow.split(/\s+/).some(p => p.length >= 3 && r.clause.toLowerCase().includes(p));
+              if(!inClause) continue;
+              parsedFacts.push({ e, says });
             }
           }
+
+          // Both ends of a relation must appear in the clause; the name
+          // can't be a pronoun; and the names must be different. Same rule
+          // for judgments. Stops the model from manufacturing edges to
+          // pronoun "entities" or fabricating link nodes out of phrases.
+          const validReadName = (name) => {
+            const s = String(name || '').trim();
+            if(!s || s.length >= 60) return false;
+            if(PRONOUN_NAMES.has(s.toLowerCase())) return false;
+            const low = s.toLowerCase();
+            const cl = r.clause.toLowerCase();
+            if(cl.includes(low)) return true;
+            return low.split(/\s+/).some(p => p.length >= 3 && cl.includes(p));
+          };
 
           // link — single CON event (small models do better with one)
           const linkRaw = j.link || j.relation;
@@ -2709,7 +2759,7 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
             const from = String(linkRaw.from || linkRaw.a || '').trim();
             const to = String(linkRaw.to || linkRaw.b || '').trim();
             const how = String(linkRaw.how || linkRaw.rel || linkRaw.type || 'related_to').trim();
-            if(from && to && from.toLowerCase() !== to.toLowerCase()) {
+            if(validReadName(from) && validReadName(to) && from.toLowerCase() !== to.toLowerCase()) {
               parsedRelations.push({ from, to, how: how.slice(0, 40) });
               parsedLink = `${from} ${how} ${to}`;
             }
@@ -2720,7 +2770,7 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
               const from = String(lk.from || '').trim();
               const to = String(lk.to || '').trim();
               const how = String(lk.how || lk.rel || 'related_to').trim();
-              if(from && to && from.toLowerCase() !== to.toLowerCase()) {
+              if(validReadName(from) && validReadName(to) && from.toLowerCase() !== to.toLowerCase()) {
                 parsedRelations.push({ from, to, how: how.slice(0, 40) });
               }
             }
@@ -2732,7 +2782,7 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
             const about = String(judgeRaw.about || judgeRaw.e || '').trim();
             const claim = String(judgeRaw.claim || judgeRaw.says || '').trim();
             const holds = (judgeRaw.holds === false || judgeRaw.status === 'fails') ? false : true;
-            if(about && claim) parsedJudgments.push({ about, claim: claim.slice(0, 200), holds });
+            if(validReadName(about) && claim) parsedJudgments.push({ about, claim: claim.slice(0, 200), holds });
           }
 
           // Speaker + alias passthrough (unchanged behaviour)
@@ -2951,18 +3001,10 @@ Example output: {"fn":"reports Smith's career move and current advisory role","f
             }
           }
       }
-        if(newSite === 'Link' && parsedLink) {
-          const lk = parsedLink.toLowerCase();
-          if(!graph.entities[lk]) graph.entities[lk] = {
-            name: parsedLink, terrain:'Link', claims:[], edges:[], mentions:[], ledgers:{}, isLink:true
-          };
-          graph.entities[lk].claims.push({
-            entity: parsedLink, value: r.clause.slice(0,80), span: r.clause,
-            rawType:'relation', operator: newOp, site:'Link', resolution:'Binding',
-            notation:`${newOp}(Link,Binding)`, clauseIndex: r.clauseIndex, fn
-          });
-          graph.entities[lk].mentions.push(r.clauseIndex);
-        }
+        // (Removed: legacy synthetic Link-site entity creation. The
+        // LLM-read CON events below now populate graph.bindings and
+        // per-entity edges directly, so we no longer manufacture
+        // sentence-shaped "[LINK]" entities.)
 
       // ── Write LLM reading into the graph ──────────────────────
       // Resolve a free-form name from the model to a canonical entity key.
